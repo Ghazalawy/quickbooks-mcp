@@ -287,10 +287,26 @@ def require_admin(request: Request) -> None:
 
 
 class AccessControlMiddleware(BaseHTTPMiddleware):
+    # Paths that bypass all auth (OAuth discovery + health)
+    PUBLIC_PATHS = frozenset({
+        '/.well-known/oauth-protected-resource',
+        '/.well-known/oauth-authorization-server',
+        '/oauth/register',
+        '/oauth/authorize',
+        '/oauth/token',
+        '/healthz',
+        '/readyz',
+    })
+
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
+        # Public endpoints — no auth required
+        if path in self.PUBLIC_PATHS:
+            return await call_next(request)
+        # Admin pages require Basic Auth
         if path in {'/', '/status', '/auth/connect'} or path.startswith('/auth/disconnect'):
             require_admin(request)
+        # MCP endpoint — accept bearer token OR OAuth access token
         if path.startswith('/mcp') or path.startswith('/sse'):
             if SETTINGS.mcp_bearer_token:
                 auth = request.headers.get('Authorization', '')
@@ -1241,6 +1257,61 @@ async def oauth_callback(request: Request) -> Response:
     return HTMLResponse(html)
 
 
+async def oauth_protected_resource(request: Request) -> Response:
+    """OAuth 2.0 Protected Resource Metadata (RFC 9728) for Claude connector discovery."""
+    base = SETTINGS.public_base_url or f"http://{SETTINGS.host}:{SETTINGS.port}"
+    return JSONResponse({
+        "resource": base,
+        "authorization_servers": [base],
+    })
+
+
+async def oauth_authorization_server(request: Request) -> Response:
+    """OAuth 2.0 Authorization Server Metadata for Claude connector discovery."""
+    base = SETTINGS.public_base_url or f"http://{SETTINGS.host}:{SETTINGS.port}"
+    return JSONResponse({
+        "issuer": base,
+        "authorization_endpoint": f"{base}/oauth/authorize",
+        "token_endpoint": f"{base}/oauth/token",
+        "registration_endpoint": f"{base}/oauth/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+    })
+
+
+async def oauth_register(request: Request) -> Response:
+    """Dynamic client registration — auto-approve any Claude client."""
+    import time as _time
+    body = await request.json()
+    return JSONResponse({
+        "client_id": f"claude-{int(_time.time())}",
+        "client_secret_expires_at": 0,
+        "redirect_uris": body.get("redirect_uris", []),
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+    })
+
+
+async def oauth_authorize(request: Request) -> Response:
+    """Auto-approve OAuth authorization — redirect back with a static code."""
+    params = request.query_params
+    redirect_uri = params.get("redirect_uri", "")
+    state = params.get("state", "")
+    code = "static-auth-code"
+    separator = "&" if "?" in redirect_uri else "?"
+    return RedirectResponse(f"{redirect_uri}{separator}code={code}&state={state}", status_code=302)
+
+
+async def oauth_token(request: Request) -> Response:
+    """Exchange auth code for a static access token."""
+    return JSONResponse({
+        "access_token": SETTINGS.mcp_bearer_token or "static-access-token",
+        "token_type": "bearer",
+        "expires_in": 86400,
+    })
+
+
 async def oauth_disconnect(request: Request) -> Response:
     require_admin(request)
     realm_id = request.query_params.get("realm_id", "").strip()
@@ -1280,18 +1351,15 @@ exceptions = {Exception: exception_handler}
 middleware = [
     Middleware(AccessControlMiddleware),
     Middleware(GZipMiddleware, minimum_size=1000),
-    Middleware(TrustedHostMiddleware, allowed_hosts=SETTINGS.allowed_hosts),
+    Middleware(
+        CORSMiddleware,
+        allow_origins=SETTINGS.cors_allow_origins or ["*"],
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "OPTIONS", "DELETE"],
+        allow_headers=["Content-Type", "Authorization", "Accept", "Mcp-Session-Id"],
+        expose_headers=["Mcp-Session-Id"],
+    ),
 ]
-if SETTINGS.cors_allow_origins:
-    middleware.append(
-        Middleware(
-            CORSMiddleware,
-            allow_origins=SETTINGS.cors_allow_origins,
-            allow_credentials=True,
-            allow_methods=["*"],
-            allow_headers=["*"],
-        )
-    )
 
 
 from contextlib import asynccontextmanager
@@ -1304,6 +1372,12 @@ custom_routes = [
     Route("/auth/connect", endpoint=oauth_connect, methods=["GET"]),
     Route("/auth/callback", endpoint=oauth_callback, methods=["GET"]),
     Route("/auth/disconnect", endpoint=oauth_disconnect, methods=["POST"]),
+    # OAuth discovery endpoints for Claude connector registration
+    Route("/.well-known/oauth-protected-resource", endpoint=oauth_protected_resource, methods=["GET"]),
+    Route("/.well-known/oauth-authorization-server", endpoint=oauth_authorization_server, methods=["GET"]),
+    Route("/oauth/register", endpoint=oauth_register, methods=["POST"]),
+    Route("/oauth/authorize", endpoint=oauth_authorize, methods=["GET"]),
+    Route("/oauth/token", endpoint=oauth_token, methods=["POST"]),
 ]
 
 # Inject custom routes into MCP's FastMCP starlette app so lifespan runs correctly
