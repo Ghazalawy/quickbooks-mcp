@@ -1,0 +1,12 @@
+services:
+  quickbooks-mcp:
+    build: .
+    container_name: quickbooks-mcp
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs

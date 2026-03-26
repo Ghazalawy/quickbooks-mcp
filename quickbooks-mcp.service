@@ -1,0 +1,18 @@
+[Unit]
+Description=QuickBooks MCP Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/quickbooks-mcp
+EnvironmentFile=/opt/quickbooks-mcp/.env
+ExecStart=/opt/quickbooks-mcp/.venv/bin/python /opt/quickbooks-mcp/quickbooks_mcp_server_prod.py --proxy-headers
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/quickbooks-mcp.log
+StandardError=append:/var/log/quickbooks-mcp.log
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
