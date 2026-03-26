@@ -730,6 +730,22 @@ def audit_failure(tool_name: str, realm_id: Optional[str], request_payload: Dict
     )
 
 
+from mcp.server.transport_security import TransportSecuritySettings
+
+# Build allowed hosts/origins from PUBLIC_BASE_URL
+_pub_host = SETTINGS.public_base_url.replace("https://", "").replace("http://", "") if SETTINGS.public_base_url else ""
+_transport_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=True,
+    allowed_hosts=[
+        "127.0.0.1:*", "localhost:*", "[::1]:*",
+        f"{_pub_host}",  f"{_pub_host}:*",
+    ],
+    allowed_origins=[
+        "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*",
+        f"https://{_pub_host}",
+    ],
+)
+
 mcp = FastMCP(
     APP_NAME,
     instructions=(
@@ -738,6 +754,7 @@ mcp = FastMCP(
         "Never invent customer IDs or item IDs."
     ),
     json_response=True,
+    transport_security=_transport_security,
 )
 
 
@@ -1277,22 +1294,31 @@ if SETTINGS.cors_allow_origins:
     )
 
 
-app = Starlette(
-    debug=False,
-    routes=[
-        Route("/", endpoint=status_page, methods=["GET"]),
-        Route("/status", endpoint=status_page, methods=["GET"]),
-        Route("/healthz", endpoint=healthz, methods=["GET"]),
-        Route("/readyz", endpoint=readyz, methods=["GET"]),
-        Route("/auth/connect", endpoint=oauth_connect, methods=["GET"]),
-        Route("/auth/callback", endpoint=oauth_callback, methods=["GET"]),
-        Route("/auth/disconnect", endpoint=oauth_disconnect, methods=["POST"]),
-        Mount("/mcp", app=mcp.streamable_http_app()),
-        Mount("/sse", app=mcp.sse_app("/sse")),
-    ],
-    middleware=middleware,
-    exception_handlers=exceptions,
-)
+from contextlib import asynccontextmanager
+
+custom_routes = [
+    Route("/", endpoint=status_page, methods=["GET"]),
+    Route("/status", endpoint=status_page, methods=["GET"]),
+    Route("/healthz", endpoint=healthz, methods=["GET"]),
+    Route("/readyz", endpoint=readyz, methods=["GET"]),
+    Route("/auth/connect", endpoint=oauth_connect, methods=["GET"]),
+    Route("/auth/callback", endpoint=oauth_callback, methods=["GET"]),
+    Route("/auth/disconnect", endpoint=oauth_disconnect, methods=["POST"]),
+]
+
+# Inject custom routes into MCP's FastMCP starlette app so lifespan runs correctly
+mcp._custom_starlette_routes = custom_routes
+
+# Build the streamable HTTP app (includes /mcp route + our custom routes + lifespan)
+app = mcp.streamable_http_app()
+
+# Add our middleware to the MCP app
+for mw in reversed(middleware):
+    app.add_middleware(mw.cls, **mw.kwargs)
+
+# Add exception handlers
+for exc_cls, handler in exceptions.items():
+    app.add_exception_handler(exc_cls, handler)
 
 
 def validate_settings() -> List[str]:
