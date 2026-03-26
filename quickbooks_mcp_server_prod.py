@@ -1097,6 +1097,312 @@ def qb_create_invoice(
         raise
 
 
+# ─────────────────────────────────────────────────────────
+# EXPANDED TOOL SET — Vendors, Accounts, Expenses, Payments,
+# Estimates, Credit Memos, Purchases, Journal Entries, Employees,
+# Departments, Classes, Tax Codes, Reports, and more.
+# ─────────────────────────────────────────────────────────
+
+
+def _make_query_tool(entity_name: str, search_fields: List[str], tool_name: str, description: str):
+    """Factory to create a standard query/search tool for a QB entity."""
+    @mcp.tool(name=tool_name, description=description)
+    def _tool(
+        query: str = "",
+        company_ref: Optional[str] = None,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        request_payload = {"query": query, "company_ref": company_ref, "limit": limit}
+        realm_id = None
+        try:
+            realm_id = pick_realm_id(company_ref)
+            lim = max(1, min(limit, 1000))
+            statement = f"SELECT * FROM {entity_name} STARTPOSITION 1 MAXRESULTS {lim}"
+            entities = _extract_query_entities(qb_client.query(realm_id, statement))
+            if query:
+                entities = _filter_local_match(entities, query, search_fields, lim)
+            result = {"realm_id": realm_id, "count": len(entities), entity_name.lower() + "s": entities}
+            return audit_success(tool_name, realm_id, request_payload, result)
+        except Exception as exc:
+            audit_failure(tool_name, realm_id, request_payload, exc)
+            raise
+    return _tool
+
+
+def _make_get_by_id_tool(entity_name: str, id_param: str, tool_name: str, description: str):
+    """Factory to create a get-by-ID tool for a QB entity."""
+    @mcp.tool(name=tool_name, description=description)
+    def _tool(entity_id: str, company_ref: Optional[str] = None) -> Dict[str, Any]:
+        request_payload = {id_param: entity_id, "company_ref": company_ref}
+        realm_id = None
+        try:
+            realm_id = pick_realm_id(company_ref)
+            payload = qb_client.request(realm_id, "GET", f"/{entity_name.lower()}/{entity_id}")
+            result = {"realm_id": realm_id, entity_name.lower(): payload.get(entity_name, payload)}
+            return audit_success(tool_name, realm_id, request_payload, result)
+        except Exception as exc:
+            audit_failure(tool_name, realm_id, request_payload, exc)
+            raise
+    return _tool
+
+
+def _make_list_transactions_tool(entity_name: str, tool_name: str, description: str):
+    """Factory to create a transaction list tool with date/customer filters."""
+    @mcp.tool(name=tool_name, description=description)
+    def _tool(
+        company_ref: Optional[str] = None,
+        customer_id: Optional[str] = None,
+        vendor_id: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        limit: int = 50,
+    ) -> Dict[str, Any]:
+        request_payload = {
+            "company_ref": company_ref, "customer_id": customer_id,
+            "vendor_id": vendor_id, "date_from": date_from, "date_to": date_to, "limit": limit,
+        }
+        realm_id = None
+        try:
+            realm_id = pick_realm_id(company_ref)
+            clauses = []
+            if customer_id:
+                clauses.append(f"CustomerRef = '{qb_escape(customer_id)}'")
+            if vendor_id:
+                clauses.append(f"VendorRef = '{qb_escape(vendor_id)}'")
+            if date_from:
+                clauses.append(f"TxnDate >= '{qb_escape(date_from)}'")
+            if date_to:
+                clauses.append(f"TxnDate <= '{qb_escape(date_to)}'")
+            where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+            lim = max(1, min(limit, 1000))
+            statement = f"SELECT * FROM {entity_name}{where} ORDERBY MetaData.LastUpdatedTime DESC STARTPOSITION 1 MAXRESULTS {lim}"
+            entities = _extract_query_entities(qb_client.query(realm_id, statement))
+            result = {"realm_id": realm_id, "count": len(entities), entity_name.lower() + "s": entities}
+            return audit_success(tool_name, realm_id, request_payload, result)
+        except Exception as exc:
+            audit_failure(tool_name, realm_id, request_payload, exc)
+            raise
+    return _tool
+
+
+def _make_report_tool(report_path: str, tool_name: str, description: str, *, uses_date_range: bool = True):
+    """Factory to create a report tool."""
+    if uses_date_range:
+        @mcp.tool(name=tool_name, description=description)
+        def _tool(
+            start_date: str,
+            end_date: str,
+            company_ref: Optional[str] = None,
+            accounting_method: str = "Accrual",
+        ) -> Dict[str, Any]:
+            request_payload = {"start_date": start_date, "end_date": end_date, "company_ref": company_ref, "accounting_method": accounting_method}
+            realm_id = None
+            try:
+                realm_id = pick_realm_id(company_ref)
+                payload = qb_client.request(realm_id, "GET", f"/reports/{report_path}", params={
+                    "start_date": start_date, "end_date": end_date, "accounting_method": accounting_method,
+                })
+                result = {"realm_id": realm_id, "report": payload}
+                return audit_success(tool_name, realm_id, request_payload, result)
+            except Exception as exc:
+                audit_failure(tool_name, realm_id, request_payload, exc)
+                raise
+    else:
+        @mcp.tool(name=tool_name, description=description)
+        def _tool(
+            as_of_date: str,
+            company_ref: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            request_payload = {"as_of_date": as_of_date, "company_ref": company_ref}
+            realm_id = None
+            try:
+                realm_id = pick_realm_id(company_ref)
+                payload = qb_client.request(realm_id, "GET", f"/reports/{report_path}", params={"report_date": as_of_date})
+                result = {"realm_id": realm_id, "report": payload}
+                return audit_success(tool_name, realm_id, request_payload, result)
+            except Exception as exc:
+                audit_failure(tool_name, realm_id, request_payload, exc)
+                raise
+    return _tool
+
+
+# ── Vendors ──
+_make_query_tool("Vendor", ["DisplayName", "CompanyName", "PrimaryEmailAddr", "GivenName", "FamilyName"],
+    "qb_find_vendors", "Find vendors/suppliers by name, company, or email.")
+_make_get_by_id_tool("Vendor", "vendor_id", "qb_get_vendor", "Fetch a single vendor by ID.")
+
+# ── Accounts (Chart of Accounts) ──
+_make_query_tool("Account", ["Name", "FullyQualifiedName", "AccountType", "AccountSubType"],
+    "qb_find_accounts", "Find accounts in the Chart of Accounts by name or type.")
+_make_get_by_id_tool("Account", "account_id", "qb_get_account", "Fetch a single account by ID.")
+
+# ── Employees ──
+_make_query_tool("Employee", ["DisplayName", "GivenName", "FamilyName", "PrimaryEmailAddr"],
+    "qb_find_employees", "Find employees by name or email.")
+
+# ── Departments ──
+_make_query_tool("Department", ["Name", "FullyQualifiedName"],
+    "qb_find_departments", "Find departments/locations.")
+
+# ── Classes ──
+_make_query_tool("Class", ["Name", "FullyQualifiedName"],
+    "qb_find_classes", "Find classes for tracking transactions.")
+
+# ── Tax Codes ──
+_make_query_tool("TaxCode", ["Name"],
+    "qb_find_tax_codes", "Find tax codes configured in QuickBooks.")
+
+# ── Tax Rates ──
+_make_query_tool("TaxRate", ["Name", "RateValue"],
+    "qb_find_tax_rates", "Find tax rates configured in QuickBooks.")
+
+# ── Payment Methods ──
+_make_query_tool("PaymentMethod", ["Name"],
+    "qb_find_payment_methods", "Find payment methods (cash, check, credit card, etc.).")
+
+# ── Terms ──
+_make_query_tool("Term", ["Name"],
+    "qb_find_terms", "Find payment terms (Net 30, Net 60, etc.).")
+
+# ── Estimates ──
+_make_list_transactions_tool("Estimate", "qb_list_estimates", "List estimates/quotes with optional date and customer filters.")
+_make_get_by_id_tool("Estimate", "estimate_id", "qb_get_estimate", "Fetch a single estimate/quote by ID.")
+
+# ── Credit Memos ──
+_make_list_transactions_tool("CreditMemo", "qb_list_credit_memos", "List credit memos with optional date and customer filters.")
+_make_get_by_id_tool("CreditMemo", "credit_memo_id", "qb_get_credit_memo", "Fetch a single credit memo by ID.")
+
+# ── Sales Receipts ──
+_make_list_transactions_tool("SalesReceipt", "qb_list_sales_receipts", "List sales receipts with optional date and customer filters.")
+_make_get_by_id_tool("SalesReceipt", "sales_receipt_id", "qb_get_sales_receipt", "Fetch a single sales receipt by ID.")
+
+# ── Payments (received from customers) ──
+_make_list_transactions_tool("Payment", "qb_list_payments", "List customer payments received with optional date and customer filters.")
+_make_get_by_id_tool("Payment", "payment_id", "qb_get_payment", "Fetch a single customer payment by ID.")
+
+# ── Bills (from vendors) ──
+_make_list_transactions_tool("Bill", "qb_list_bills", "List bills from vendors with optional date and vendor filters.")
+_make_get_by_id_tool("Bill", "bill_id", "qb_get_bill", "Fetch a single bill by ID.")
+
+# ── Bill Payments ──
+_make_list_transactions_tool("BillPayment", "qb_list_bill_payments", "List bill payments with optional date and vendor filters.")
+_make_get_by_id_tool("BillPayment", "bill_payment_id", "qb_get_bill_payment", "Fetch a single bill payment by ID.")
+
+# ── Purchase Orders ──
+_make_list_transactions_tool("PurchaseOrder", "qb_list_purchase_orders", "List purchase orders with optional date and vendor filters.")
+_make_get_by_id_tool("PurchaseOrder", "purchase_order_id", "qb_get_purchase_order", "Fetch a single purchase order by ID.")
+
+# ── Purchases / Expenses ──
+_make_list_transactions_tool("Purchase", "qb_list_purchases", "List purchases/expenses (checks, cash, credit card) with optional date filters.")
+_make_get_by_id_tool("Purchase", "purchase_id", "qb_get_purchase", "Fetch a single purchase/expense by ID.")
+
+# ── Deposits ──
+_make_list_transactions_tool("Deposit", "qb_list_deposits", "List bank deposits with optional date filters.")
+_make_get_by_id_tool("Deposit", "deposit_id", "qb_get_deposit", "Fetch a single deposit by ID.")
+
+# ── Transfers ──
+_make_list_transactions_tool("Transfer", "qb_list_transfers", "List fund transfers between accounts with optional date filters.")
+_make_get_by_id_tool("Transfer", "transfer_id", "qb_get_transfer", "Fetch a single transfer by ID.")
+
+# ── Journal Entries ──
+_make_list_transactions_tool("JournalEntry", "qb_list_journal_entries", "List journal entries with optional date filters.")
+_make_get_by_id_tool("JournalEntry", "journal_entry_id", "qb_get_journal_entry", "Fetch a single journal entry by ID.")
+
+# ── Refund Receipts ──
+_make_list_transactions_tool("RefundReceipt", "qb_list_refund_receipts", "List refund receipts with optional date and customer filters.")
+_make_get_by_id_tool("RefundReceipt", "refund_receipt_id", "qb_get_refund_receipt", "Fetch a single refund receipt by ID.")
+
+# ── Vendor Credits ──
+_make_list_transactions_tool("VendorCredit", "qb_list_vendor_credits", "List vendor credits with optional date and vendor filters.")
+_make_get_by_id_tool("VendorCredit", "vendor_credit_id", "qb_get_vendor_credit", "Fetch a single vendor credit by ID.")
+
+# ── Time Activities ──
+_make_list_transactions_tool("TimeActivity", "qb_list_time_activities", "List time tracking entries with optional date filters.")
+
+# ── Additional Reports ──
+_make_report_tool("CashFlow", "qb_get_cash_flow", "Run a Statement of Cash Flows report.")
+_make_report_tool("GeneralLedger", "qb_get_general_ledger", "Run a General Ledger report.")
+_make_report_tool("TrialBalance", "qb_get_trial_balance", "Run a Trial Balance report.")
+_make_report_tool("AgedPayables", "qb_get_ap_aging", "Run Accounts Payable Aging Summary.", uses_date_range=False)
+_make_report_tool("CustomerIncome", "qb_get_customer_income", "Run Customer Income report showing revenue by customer.")
+_make_report_tool("VendorExpenses", "qb_get_vendor_expenses", "Run Vendor Expenses report showing spending by vendor.")
+_make_report_tool("CustomerBalance", "qb_get_customer_balance", "Run Customer Balance Summary report.", uses_date_range=False)
+_make_report_tool("VendorBalance", "qb_get_vendor_balance", "Run Vendor Balance Summary report.", uses_date_range=False)
+_make_report_tool("ProfitAndLossDetail", "qb_get_profit_and_loss_detail", "Run a detailed Profit and Loss report with transaction-level detail.")
+_make_report_tool("TransactionList", "qb_get_transaction_list", "Run a Transaction List report showing all transactions in a date range.")
+
+
+@mcp.tool()
+def qb_query(
+    statement: str,
+    company_ref: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Execute a raw QuickBooks query (SELECT only). Example: SELECT * FROM Invoice WHERE TotalAmt > '1000'"""
+    request_payload = {"statement": statement, "company_ref": company_ref}
+    realm_id = None
+    try:
+        s = statement.strip()
+        if not s.upper().startswith("SELECT"):
+            raise QuickBooksError("Only SELECT queries are allowed.", status_code=400)
+        realm_id = pick_realm_id(company_ref)
+        entities = _extract_query_entities(qb_client.query(realm_id, s))
+        result = {"realm_id": realm_id, "count": len(entities), "rows": entities}
+        return audit_success("qb_query", realm_id, request_payload, result)
+    except Exception as exc:
+        audit_failure("qb_query", realm_id, request_payload, exc)
+        raise
+
+
+@mcp.tool()
+def qb_get_customer(customer_id: str, company_ref: Optional[str] = None) -> Dict[str, Any]:
+    """Fetch a single customer by QuickBooks customer ID with full details."""
+    request_payload = {"customer_id": customer_id, "company_ref": company_ref}
+    realm_id = None
+    try:
+        realm_id = pick_realm_id(company_ref)
+        payload = qb_client.request(realm_id, "GET", f"/customer/{customer_id}")
+        result = {"realm_id": realm_id, "customer": payload.get("Customer", payload)}
+        return audit_success("qb_get_customer", realm_id, request_payload, result)
+    except Exception as exc:
+        audit_failure("qb_get_customer", realm_id, request_payload, exc)
+        raise
+
+
+@mcp.tool()
+def qb_get_item(item_id: str, company_ref: Optional[str] = None) -> Dict[str, Any]:
+    """Fetch a single item (product/service) by QuickBooks item ID."""
+    request_payload = {"item_id": item_id, "company_ref": company_ref}
+    realm_id = None
+    try:
+        realm_id = pick_realm_id(company_ref)
+        payload = qb_client.request(realm_id, "GET", f"/item/{item_id}")
+        result = {"realm_id": realm_id, "item": payload.get("Item", payload)}
+        return audit_success("qb_get_item", realm_id, request_payload, result)
+    except Exception as exc:
+        audit_failure("qb_get_item", realm_id, request_payload, exc)
+        raise
+
+
+@mcp.tool()
+def qb_count_entities(
+    entity_type: str,
+    company_ref: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Count entities of a given type. entity_type examples: Invoice, Customer, Bill, Vendor, Item, Payment, etc."""
+    request_payload = {"entity_type": entity_type, "company_ref": company_ref}
+    realm_id = None
+    try:
+        realm_id = pick_realm_id(company_ref)
+        statement = f"SELECT COUNT(*) FROM {entity_type}"
+        payload = qb_client.query(realm_id, statement)
+        count = payload.get("QueryResponse", {}).get("totalCount", 0)
+        result = {"realm_id": realm_id, "entity_type": entity_type, "count": count}
+        return audit_success("qb_count_entities", realm_id, request_payload, result)
+    except Exception as exc:
+        audit_failure("qb_count_entities", realm_id, request_payload, exc)
+        raise
+
+
 async def healthz(_: Request) -> Response:
     return JSONResponse({"ok": True, "app": APP_NAME, "time": iso_now(), "environment": SETTINGS.app_env})
 
