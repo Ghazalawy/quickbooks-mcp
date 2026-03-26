@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1E8A14;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:#2CA01C;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1B7A45;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="nodeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#6C5CE7;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#4A90D9;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="dollarGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#FFFFFF;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#E8F5E9;stop-opacity:0.95" />
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#000000" flood-opacity="0.25"/>
+    </filter>
+    <filter id="innerGlow">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="3" result="blur"/>
+      <feOffset in="blur" dx="0" dy="2" result="offsetBlur"/>
+      <feFlood flood-color="#ffffff" flood-opacity="0.15" result="color"/>
+      <feComposite in="color" in2="offsetBlur" operator="in" result="glow"/>
+      <feMerge>
+        <feMergeNode in="SourceGraphic"/>
+        <feMergeNode in="glow"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background rounded square -->
+  <rect x="32" y="32" width="448" height="448" rx="96" ry="96" fill="url(#bgGrad)" filter="url(#shadow)"/>
+
+  <!-- Subtle inner highlight -->
+  <rect x="36" y="36" width="440" height="220" rx="94" ry="94" fill="url(#dollarGrad)" opacity="0.06"/>
+
+  <!-- Circuit/connection lines (behind elements) -->
+  <g stroke="#4A90D9" stroke-width="2.5" stroke-opacity="0.5" fill="none" stroke-linecap="round">
+    <!-- Top left node to center -->
+    <line x1="130" y1="130" x2="200" y2="190"/>
+    <!-- Top right node to center -->
+    <line x1="382" y1="130" x2="312" y2="190"/>
+    <!-- Bottom left node to center -->
+    <line x1="130" y1="382" x2="200" y2="322"/>
+    <!-- Bottom right node to center -->
+    <line x1="382" y1="382" x2="312" y2="322"/>
+    <!-- Side connections -->
+    <line x1="100" y1="256" x2="170" y2="256"/>
+    <line x1="412" y1="256" x2="342" y2="256"/>
+  </g>
+
+  <!-- Central book/ledger shape -->
+  <g filter="url(#innerGlow)">
+    <!-- Book body -->
+    <rect x="170" y="160" width="172" height="192" rx="12" ry="12" fill="white" opacity="0.95"/>
+    <!-- Book spine -->
+    <rect x="170" y="160" width="16" height="192" rx="4" ry="0" fill="#E8F5E9" opacity="0.8"/>
+    <!-- Ledger lines -->
+    <line x1="200" y1="210" x2="326" y2="210" stroke="#2CA01C" stroke-width="2" stroke-opacity="0.3"/>
+    <line x1="200" y1="240" x2="326" y2="240" stroke="#2CA01C" stroke-width="2" stroke-opacity="0.3"/>
+    <line x1="200" y1="270" x2="326" y2="270" stroke="#2CA01C" stroke-width="2" stroke-opacity="0.3"/>
+    <line x1="200" y1="300" x2="326" y2="300" stroke="#2CA01C" stroke-width="2" stroke-opacity="0.3"/>
+  </g>
+
+  <!-- Dollar sign on the book -->
+  <text x="256" y="290" font-family="Arial, Helvetica, sans-serif" font-weight="700" font-size="100" fill="#2CA01C" text-anchor="middle" dominant-baseline="central" opacity="0.85">$</text>
+
+  <!-- Network/AI nodes - corners -->
+  <g>
+    <!-- Top-left node -->
+    <circle cx="130" cy="130" r="22" fill="url(#nodeGrad)" opacity="0.9"/>
+    <circle cx="130" cy="130" r="10" fill="white" opacity="0.85"/>
+
+    <!-- Top-right node -->
+    <circle cx="382" cy="130" r="22" fill="url(#nodeGrad)" opacity="0.9"/>
+    <circle cx="382" cy="130" r="10" fill="white" opacity="0.85"/>
+
+    <!-- Bottom-left node -->
+    <circle cx="130" cy="382" r="22" fill="url(#nodeGrad)" opacity="0.9"/>
+    <circle cx="130" cy="382" r="10" fill="white" opacity="0.85"/>
+
+    <!-- Bottom-right node -->
+    <circle cx="382" cy="382" r="22" fill="url(#nodeGrad)" opacity="0.9"/>
+    <circle cx="382" cy="382" r="10" fill="white" opacity="0.85"/>
+
+    <!-- Left-center node -->
+    <circle cx="100" cy="256" r="16" fill="url(#nodeGrad)" opacity="0.75"/>
+    <circle cx="100" cy="256" r="7" fill="white" opacity="0.8"/>
+
+    <!-- Right-center node -->
+    <circle cx="412" cy="256" r="16" fill="url(#nodeGrad)" opacity="0.75"/>
+    <circle cx="412" cy="256" r="7" fill="white" opacity="0.8"/>
+  </g>
+
+  <!-- Small accent dots on circuit lines -->
+  <g fill="#4A90D9" opacity="0.6">
+    <circle cx="165" cy="160" r="4"/>
+    <circle cx="347" cy="160" r="4"/>
+    <circle cx="165" cy="352" r="4"/>
+    <circle cx="347" cy="352" r="4"/>
+  </g>
+
+  <!-- MCP label badge at bottom -->
+  <rect x="196" y="370" width="120" height="36" rx="18" ry="18" fill="#6C5CE7" opacity="0.9"/>
+  <text x="256" y="393" font-family="Arial, Helvetica, sans-serif" font-weight="700" font-size="18" fill="white" text-anchor="middle" letter-spacing="3">MCP</text>
+</svg>
