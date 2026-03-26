@@ -1,0 +1,75 @@
+name: Deploy QuickBooks MCP to Hetzner
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'quickbooks_mcp_server_prod.py'
+      - 'requirements.txt'
+      - '.github/workflows/deploy.yml'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.HETZNER_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.HETZNER_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Deploy to server
+        env:
+          SSH_HOST: ${{ secrets.HETZNER_HOST }}
+          SSH_USER: ${{ secrets.HETZNER_USER }}
+        run: |
+          SSH_CMD="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_HOST}"
+
+          # Copy the main server file
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            quickbooks_mcp_server_prod.py \
+            ${SSH_USER}@${SSH_HOST}:/opt/quickbooks-mcp/quickbooks_mcp_server_prod.py
+
+          # Copy requirements if changed
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            requirements.txt \
+            ${SSH_USER}@${SSH_HOST}:/opt/quickbooks-mcp/requirements.txt
+
+          # Install any new dependencies and restart
+          $SSH_CMD "
+            cd /opt/quickbooks-mcp
+            .venv/bin/pip install -q -r requirements.txt 2>&1 | tail -3
+            systemctl restart quickbooks-mcp
+            sleep 3
+            if systemctl is-active --quiet quickbooks-mcp; then
+              echo '✅ QuickBooks MCP restarted successfully'
+              systemctl status quickbooks-mcp --no-pager | head -8
+            else
+              echo '❌ Service failed to start!'
+              journalctl -u quickbooks-mcp --no-pager -n 20
+              exit 1
+            fi
+          "
+
+      - name: Health check
+        env:
+          SSH_HOST: ${{ secrets.HETZNER_HOST }}
+          SSH_USER: ${{ secrets.HETZNER_USER }}
+        run: |
+          # Verify the MCP endpoint is responding
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://qb-mcp.prizm-energy.com/healthz)
+          if [ "$STATUS" = "200" ]; then
+            echo "✅ Health check passed (HTTP $STATUS)"
+          else
+            echo "⚠️ Health check returned HTTP $STATUS (may need admin auth)"
+          fi
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
