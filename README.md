@@ -2,11 +2,22 @@
 
 This package upgrades the local starter into a cloud-ready service you can deploy on your ERP server.
 
-**Version 2.1.1** — 68 tools. Adds `qb_patch_purchase_line` convenience wrapper
-that edits a single Line of a Purchase without disturbing the others (handles
-both Category details and Item details rows). Builds on 2.1.0's write surface:
-`qb_create_purchase`, `qb_update_purchase`, `qb_void_purchase`,
-`qb_create_journal_entry`, `qb_create_attachable`.
+**Version 2.2.0** — 68 tools. `qb_create_attachable` now accepts four mutually
+exclusive source modes (pick one):
+
+| Mode | Use when |
+| --- | --- |
+| `file_bytes_b64` | small files where inline base64 fits the MCP-call budget |
+| `file_path` | file already lives on the MCP server (must be under `QB_ATTACHABLE_UPLOAD_DIR`) |
+| `file_url` | file is reachable via http(s); MCP streams it (use `file_url_auth_header` for protected URLs) |
+| `from_email_attachment` | `{mailbox, email_id, attachment_id, graph_access_token}` — MCP calls Microsoft Graph and streams the attachment straight into QB, skipping the base64 round-trip entirely |
+
+`filename` and `mime` are now optional — auto-derived from filesystem extension,
+HTTP `Content-Disposition` / `Content-Type`, or Graph attachment metadata.
+The `graph_access_token` is redacted from the audit log before persistence.
+
+Earlier in 2.1: `qb_create_purchase`, `qb_update_purchase`, `qb_patch_purchase_line`,
+`qb_void_purchase`, `qb_create_journal_entry`.
 
 ## What changed from the starter
 - Public-base-URL aware OAuth flow for real HTTPS deployment

@@ -16,7 +16,8 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, Iterable, List, Optional
-from urllib.parse import urlencode
+from pathlib import Path
+from urllib.parse import urlencode, urlparse, unquote
 
 import requests
 from cryptography.fernet import Fernet, InvalidToken
@@ -37,7 +38,7 @@ from starlette.routing import Mount, Route
 import uvicorn
 
 APP_NAME = "QuickBooks Online MCP Server"
-APP_VERSION = "2.1.1"  # 68 tools — adds qb_patch_purchase_line convenience wrapper
+APP_VERSION = "2.2.0"  # qb_create_attachable: file_path / file_url / from_email_attachment
 DEFAULT_SCOPE = "com.intuit.quickbooks.accounting"
 SANDBOX_DISCOVERY = "https://developer.api.intuit.com/.well-known/openid_sandbox_configuration"
 PRODUCTION_DISCOVERY = "https://developer.api.intuit.com/.well-known/openid_configuration"
@@ -85,6 +86,9 @@ class Settings:
     max_purchase_total: str = os.getenv("QB_MAX_PURCHASE_TOTAL", "50000.00").strip()
     max_journal_total: str = os.getenv("QB_MAX_JOURNAL_TOTAL", "100000.00").strip()
     max_attachment_size_bytes: int = int(os.getenv("QB_MAX_ATTACHMENT_SIZE_BYTES", "10485760").strip())
+    attachable_upload_dir: str = os.getenv("QB_ATTACHABLE_UPLOAD_DIR", "/opt/quickbooks-mcp/uploads").strip()
+    attachable_url_allow_http: bool = os.getenv("QB_ATTACHABLE_URL_ALLOW_HTTP", "false").strip().lower() in {"1", "true", "yes", "on"}
+    graph_base_url: str = os.getenv("QB_GRAPH_BASE_URL", "https://graph.microsoft.com/v1.0").strip().rstrip("/")
     require_idempotency_key: bool = os.getenv("QB_REQUIRE_IDEMPOTENCY_KEY", "true").strip().lower() in {"1", "true", "yes", "on"}
 
     status_page_enabled: bool = os.getenv("STATUS_PAGE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -1796,44 +1800,263 @@ _VALID_ATTACH_TXN_TYPES = {
     "Customer", "Vendor", "Item", "Employee",
 }
 
+_COMMON_MIME_MAP = {
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".txt": "text/plain",
+    ".csv": "text/csv",
+    ".xml": "application/xml",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".zip": "application/zip",
+    ".json": "application/json",
+    ".eml": "message/rfc822",
+}
+
+
+def _guess_mime_from_filename(filename: str) -> str:
+    if not filename:
+        return "application/octet-stream"
+    ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    return _COMMON_MIME_MAP.get(ext, "application/octet-stream")
+
+
+def _fetch_file_from_path(file_path: str) -> bytes:
+    """Read a local file, constrained to QB_ATTACHABLE_UPLOAD_DIR for safety."""
+    upload_dir = Path(SETTINGS.attachable_upload_dir).expanduser().resolve()
+    try:
+        target = Path(file_path).expanduser().resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise QuickBooksError(f"file_path not found: {file_path}", status_code=404) from exc
+    try:
+        target.relative_to(upload_dir)
+    except ValueError as exc:
+        raise QuickBooksError(
+            f"file_path must be inside QB_ATTACHABLE_UPLOAD_DIR ({upload_dir}).",
+            status_code=403,
+        ) from exc
+    if not target.is_file():
+        raise QuickBooksError(f"file_path is not a regular file: {file_path}", status_code=400)
+    if target.stat().st_size > SETTINGS.max_attachment_size_bytes:
+        raise QuickBooksError(
+            f"File size exceeds limit {SETTINGS.max_attachment_size_bytes} bytes.",
+            status_code=400,
+        )
+    return target.read_bytes()
+
+
+def _fetch_file_from_url(url: str, auth_header: Optional[str] = None) -> tuple:
+    """GET a file from an HTTPS URL (streaming). Returns (bytes, fallback_filename, fallback_mime)."""
+    parsed = urlparse(url)
+    if parsed.scheme == "http" and not SETTINGS.attachable_url_allow_http:
+        raise QuickBooksError(
+            "http:// URLs are not allowed (set QB_ATTACHABLE_URL_ALLOW_HTTP=true to override).",
+            status_code=400,
+        )
+    if parsed.scheme not in {"http", "https"}:
+        raise QuickBooksError("file_url must be an http(s) URL.", status_code=400)
+    headers = {"Accept": "*/*"}
+    if auth_header:
+        headers["Authorization"] = auth_header
+    resp = requests.get(url, headers=headers, stream=True, timeout=SETTINGS.request_timeout_seconds, allow_redirects=True)
+    if resp.status_code >= 400:
+        raise QuickBooksError(
+            f"file_url fetch failed: HTTP {resp.status_code} {resp.text[:200]}",
+            status_code=resp.status_code,
+        )
+    limit = SETTINGS.max_attachment_size_bytes
+    chunks = []
+    total = 0
+    for chunk in resp.iter_content(chunk_size=65536):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > limit:
+            raise QuickBooksError(
+                f"file_url body exceeds limit {limit} bytes.",
+                status_code=413,
+            )
+        chunks.append(chunk)
+    file_bytes = b"".join(chunks)
+
+    cd = resp.headers.get("Content-Disposition", "")
+    fallback_filename = ""
+    if "filename=" in cd:
+        fallback_filename = cd.split("filename=", 1)[1].strip().strip('"').strip("'").split(";")[0]
+        fallback_filename = unquote(fallback_filename)
+    if not fallback_filename:
+        fallback_filename = unquote(parsed.path.rsplit("/", 1)[-1]) or "download"
+    fallback_mime = resp.headers.get("Content-Type", "").split(";")[0].strip() or _guess_mime_from_filename(fallback_filename)
+    return file_bytes, fallback_filename, fallback_mime
+
+
+def _fetch_file_from_email_attachment(spec: Dict[str, Any]) -> tuple:
+    """Download a Microsoft Graph mail attachment as raw bytes.
+
+    spec = {
+        mailbox             : UPN of the mailbox owner ("user@domain.com"), or "me"
+        email_id            : the message id
+        attachment_id       : the attachment id
+        graph_access_token  : OAuth bearer token with Mail.Read for that mailbox
+    }
+    Returns (bytes, fallback_filename, fallback_mime).
+    """
+    required = ("mailbox", "email_id", "attachment_id", "graph_access_token")
+    missing = [k for k in required if not spec.get(k)]
+    if missing:
+        raise QuickBooksError(
+            f"from_email_attachment is missing required keys: {missing}",
+            status_code=400,
+        )
+    mailbox = str(spec["mailbox"]).strip()
+    email_id = str(spec["email_id"]).strip()
+    attachment_id = str(spec["attachment_id"]).strip()
+    token = str(spec["graph_access_token"]).strip()
+
+    if mailbox.lower() == "me":
+        owner_path = "me"
+    else:
+        owner_path = f"users/{mailbox}"
+
+    metadata_url = f"{SETTINGS.graph_base_url}/{owner_path}/messages/{email_id}/attachments/{attachment_id}"
+    meta_resp = requests.get(
+        metadata_url,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        timeout=SETTINGS.request_timeout_seconds,
+    )
+    if meta_resp.status_code >= 400:
+        raise QuickBooksError(
+            f"Microsoft Graph attachment metadata fetch failed: HTTP {meta_resp.status_code} {meta_resp.text[:200]}",
+            status_code=meta_resp.status_code,
+        )
+    meta = meta_resp.json()
+    fallback_filename = meta.get("name") or "attachment"
+    fallback_mime = meta.get("contentType") or _guess_mime_from_filename(fallback_filename)
+    size = meta.get("size")
+    if isinstance(size, int) and size > SETTINGS.max_attachment_size_bytes:
+        raise QuickBooksError(
+            f"Email attachment size {size} exceeds limit {SETTINGS.max_attachment_size_bytes} bytes.",
+            status_code=413,
+        )
+
+    if "contentBytes" in meta and meta["contentBytes"]:
+        try:
+            return base64.b64decode(meta["contentBytes"], validate=True), fallback_filename, fallback_mime
+        except Exception as exc:
+            raise QuickBooksError("Graph returned malformed contentBytes for attachment.", status_code=502) from exc
+
+    value_url = f"{metadata_url}/$value"
+    val_resp = requests.get(
+        value_url,
+        headers={"Authorization": f"Bearer {token}"},
+        stream=True,
+        timeout=SETTINGS.request_timeout_seconds,
+        allow_redirects=True,
+    )
+    if val_resp.status_code >= 400:
+        raise QuickBooksError(
+            f"Microsoft Graph attachment download failed: HTTP {val_resp.status_code} {val_resp.text[:200]}",
+            status_code=val_resp.status_code,
+        )
+    limit = SETTINGS.max_attachment_size_bytes
+    chunks = []
+    total = 0
+    for chunk in val_resp.iter_content(chunk_size=65536):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > limit:
+            raise QuickBooksError(
+                f"Email attachment body exceeds limit {limit} bytes.",
+                status_code=413,
+            )
+        chunks.append(chunk)
+    return b"".join(chunks), fallback_filename, fallback_mime
+
+
+def _redact_email_attachment_spec(spec: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(spec, dict):
+        return spec
+    out = {k: v for k, v in spec.items() if k != "graph_access_token"}
+    if "graph_access_token" in spec:
+        out["graph_access_token"] = "***REDACTED***"
+    return out
+
 
 @mcp.tool()
 def qb_create_attachable(
-    filename: str,
-    file_bytes_b64: str,
-    mime: str,
+    filename: Optional[str] = None,
+    mime: Optional[str] = None,
+    file_bytes_b64: Optional[str] = None,
+    file_path: Optional[str] = None,
+    file_url: Optional[str] = None,
+    file_url_auth_header: Optional[str] = None,
+    from_email_attachment: Optional[Dict[str, Any]] = None,
     link_to_txn_id: Optional[str] = None,
     link_to_txn_type: Optional[str] = None,
     note: str = "",
     company_ref: Optional[str] = None,
     idempotency_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Upload a file to QuickBooks and optionally attach it to a transaction or entity.
+    """Upload a file to QuickBooks and optionally link it to a transaction or entity.
 
-    filename         — display name for the uploaded file
-    file_bytes_b64   — file content as base64-encoded string
-    mime             — MIME type (e.g. "application/pdf", "image/png")
-    link_to_txn_id   — optional QB entity ID to attach this file to
-    link_to_txn_type — entity type for the link (e.g. "Purchase", "Invoice", "Bill", "JournalEntry")
-    note             — optional note stored on the Attachable
+    Exactly ONE source must be provided:
+      • file_bytes_b64        — raw bytes as base64 (legacy mode; subject to MCP-call size budget)
+      • file_path             — local path on the MCP server, must be inside QB_ATTACHABLE_UPLOAD_DIR
+      • file_url              — http(s) URL the MCP fetches and streams (use file_url_auth_header for protected URLs)
+      • from_email_attachment — {mailbox, email_id, attachment_id, graph_access_token} —
+                                MCP calls Microsoft Graph and streams the attachment bytes
+                                directly into the QB upload (no base64 round-trip needed).
+
+    filename / mime are optional when using file_path / file_url / from_email_attachment —
+    they're auto-derived from filesystem extension, Content-Disposition / Content-Type, or
+    the Graph attachment metadata. You can still pass them explicitly to override.
+
+    link_to_txn_id + link_to_txn_type — optional; attach the uploaded file to a QB entity.
     Disabled unless QB_ENABLE_ATTACHABLE_WRITE=true.
     """
+    sources_set = sum(1 for x in (file_bytes_b64, file_path, file_url, from_email_attachment) if x)
     request_payload = {
         "filename": filename,
         "mime": mime,
+        "has_file_bytes_b64": bool(file_bytes_b64),
+        "file_bytes_b64_len": len(file_bytes_b64 or ""),
+        "file_path": file_path,
+        "file_url": file_url,
+        "has_file_url_auth_header": bool(file_url_auth_header),
+        "from_email_attachment": _redact_email_attachment_spec(from_email_attachment),
         "link_to_txn_id": link_to_txn_id,
         "link_to_txn_type": link_to_txn_type,
         "note": note,
         "company_ref": company_ref,
         "idempotency_key": idempotency_key,
-        "file_size_b64": len(file_bytes_b64 or ""),
     }
     realm_id = None
     try:
         if not SETTINGS.enable_attachable_write:
             raise QuickBooksError("Attachable creation is disabled on this server.", status_code=403)
-        if not filename or not mime or not file_bytes_b64:
-            raise QuickBooksError("filename, mime, and file_bytes_b64 are required.", status_code=400)
+        if sources_set == 0:
+            raise QuickBooksError(
+                "One source is required: file_bytes_b64, file_path, file_url, or from_email_attachment.",
+                status_code=400,
+            )
+        if sources_set > 1:
+            raise QuickBooksError(
+                "Provide exactly ONE source — file_bytes_b64, file_path, file_url, or from_email_attachment.",
+                status_code=400,
+            )
         if (link_to_txn_id and not link_to_txn_type) or (link_to_txn_type and not link_to_txn_id):
             raise QuickBooksError("link_to_txn_id and link_to_txn_type must be provided together.", status_code=400)
         if link_to_txn_type and link_to_txn_type not in _VALID_ATTACH_TXN_TYPES:
@@ -1843,21 +2066,42 @@ def qb_create_attachable(
             )
         realm_id = pick_realm_id(company_ref)
 
-        try:
-            file_bytes = base64.b64decode(file_bytes_b64, validate=True)
-        except Exception as exc:
-            raise QuickBooksError("file_bytes_b64 is not valid base64.", status_code=400) from exc
+        # ── Resolve source → bytes (+ fallback filename/mime) ───────────────
+        fallback_filename: Optional[str] = None
+        fallback_mime: Optional[str] = None
+        if file_bytes_b64:
+            try:
+                file_bytes = base64.b64decode(file_bytes_b64, validate=True)
+            except Exception as exc:
+                raise QuickBooksError("file_bytes_b64 is not valid base64.", status_code=400) from exc
+        elif file_path:
+            file_bytes = _fetch_file_from_path(file_path)
+            fallback_filename = Path(file_path).name
+            fallback_mime = _guess_mime_from_filename(fallback_filename)
+        elif file_url:
+            file_bytes, fallback_filename, fallback_mime = _fetch_file_from_url(file_url, file_url_auth_header)
+        else:
+            file_bytes, fallback_filename, fallback_mime = _fetch_file_from_email_attachment(from_email_attachment or {})
+
         if len(file_bytes) == 0:
-            raise QuickBooksError("file_bytes_b64 decoded to zero bytes.", status_code=400)
+            raise QuickBooksError("Resolved file is zero bytes.", status_code=400)
         if len(file_bytes) > SETTINGS.max_attachment_size_bytes:
             raise QuickBooksError(
-                f"Attachment size {len(file_bytes)} exceeds limit {SETTINGS.max_attachment_size_bytes}.",
+                f"Attachment size {len(file_bytes)} exceeds limit {SETTINGS.max_attachment_size_bytes} bytes.",
                 status_code=400,
             )
 
+        effective_filename = (filename or fallback_filename or "").strip()
+        if not effective_filename:
+            raise QuickBooksError("filename is required (could not be inferred from source).", status_code=400)
+        effective_mime = (mime or fallback_mime or _guess_mime_from_filename(effective_filename)).strip()
+        if not effective_mime:
+            effective_mime = "application/octet-stream"
+
+        # ── Idempotency keyed on the resolved content hash ──────────────────
         request_hash = compute_request_hash({
-            "filename": filename,
-            "mime": mime,
+            "filename": effective_filename,
+            "mime": effective_mime,
             "link_to_txn_id": link_to_txn_id,
             "link_to_txn_type": link_to_txn_type,
             "note": note,
@@ -1874,8 +2118,8 @@ def qb_create_attachable(
                 return audit_success("qb_create_attachable", realm_id, request_payload, existing["response"])
 
         metadata: Dict[str, Any] = {
-            "FileName": filename,
-            "ContentType": mime,
+            "FileName": effective_filename,
+            "ContentType": effective_mime,
         }
         if note:
             metadata["Note"] = note
@@ -1887,7 +2131,7 @@ def qb_create_attachable(
 
         files = [
             ("file_metadata_0", ("metadata.json", json.dumps(metadata).encode("utf-8"), "application/json")),
-            ("file_content_0", (filename, file_bytes, mime)),
+            ("file_content_0", (effective_filename, file_bytes, effective_mime)),
         ]
         response = qb_client.upload_multipart(realm_id, "/upload", files)
 
@@ -1900,7 +2144,15 @@ def qb_create_attachable(
                 )
             if entry.get("Attachable"):
                 attachables.append(entry["Attachable"])
-        result = {"realm_id": realm_id, "attachables": attachables, "raw": response}
+        result = {
+            "realm_id": realm_id,
+            "attachables": attachables,
+            "raw": response,
+            "resolved_filename": effective_filename,
+            "resolved_mime": effective_mime,
+            "resolved_size_bytes": len(file_bytes),
+            "resolved_sha256": hashlib.sha256(file_bytes).hexdigest(),
+        }
         if idempotency_key:
             try:
                 IdempotencyStore.put(idempotency_key, "qb_create_attachable", request_hash, result)
@@ -2572,6 +2824,7 @@ def print_startup_banner() -> None:
     logger.info("Purchase write    : %s", SETTINGS.enable_purchase_write)
     logger.info("Journal write     : %s", SETTINGS.enable_journal_write)
     logger.info("Attachable write  : %s", SETTINGS.enable_attachable_write)
+    logger.info("Attach upload dir : %s", SETTINGS.attachable_upload_dir)
     logger.info("%s", "=" * 78)
 
 
