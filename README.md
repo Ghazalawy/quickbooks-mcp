@@ -2,9 +2,11 @@
 
 This package upgrades the local starter into a cloud-ready service you can deploy on your ERP server.
 
-**Version 2.1.0** — adds full purchase/journal-entry/attachable write surface
-(`qb_create_purchase`, `qb_update_purchase`, `qb_void_purchase`,
-`qb_create_journal_entry`, `qb_create_attachable`), bringing the tool count to **67**.
+**Version 2.1.1** — 68 tools. Adds `qb_patch_purchase_line` convenience wrapper
+that edits a single Line of a Purchase without disturbing the others (handles
+both Category details and Item details rows). Builds on 2.1.0's write surface:
+`qb_create_purchase`, `qb_update_purchase`, `qb_void_purchase`,
+`qb_create_journal_entry`, `qb_create_attachable`.
 
 ## What changed from the starter
 - Public-base-URL aware OAuth flow for real HTTPS deployment
@@ -152,7 +154,8 @@ Write tools (each off by default — set the matching flag to `true` to enable):
 | --- | --- | --- |
 | `qb_create_invoice` | `QB_ENABLE_INVOICE_WRITE` | Create an invoice |
 | `qb_create_purchase` | `QB_ENABLE_PURCHASE_WRITE` | Create a Cash/Check/CreditCard expense |
-| `qb_update_purchase` | `QB_ENABLE_PURCHASE_WRITE` | Sparse-update an existing purchase |
+| `qb_update_purchase` | `QB_ENABLE_PURCHASE_WRITE` | Sparse-update an existing purchase (replaces full `Line[]` if line_items in patch) |
+| `qb_patch_purchase_line` | `QB_ENABLE_PURCHASE_WRITE` | Edit one Line of a Purchase by index (read-mutate-write; preserves all other lines, both Category and Item details) |
 | `qb_void_purchase` | `QB_ENABLE_PURCHASE_WRITE` | Delete a purchase (QB has no `void` op on Purchase — uses `operation=delete` for rollback) |
 | `qb_create_journal_entry` | `QB_ENABLE_JOURNAL_WRITE` | Create a balanced journal entry (debits == credits) |
 | `qb_create_attachable` | `QB_ENABLE_ATTACHABLE_WRITE` | Upload a file and optionally link it to a transaction or entity |

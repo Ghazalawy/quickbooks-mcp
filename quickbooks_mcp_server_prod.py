@@ -37,7 +37,7 @@ from starlette.routing import Mount, Route
 import uvicorn
 
 APP_NAME = "QuickBooks Online MCP Server"
-APP_VERSION = "2.1.0"  # 67 tools — adds purchase/journal/attachable writes
+APP_VERSION = "2.1.1"  # 68 tools — adds qb_patch_purchase_line convenience wrapper
 DEFAULT_SCOPE = "com.intuit.quickbooks.accounting"
 SANDBOX_DISCOVERY = "https://developer.api.intuit.com/.well-known/openid_sandbox_configuration"
 PRODUCTION_DISCOVERY = "https://developer.api.intuit.com/.well-known/openid_configuration"
@@ -1516,6 +1516,135 @@ def qb_void_purchase(
         return audit_success("qb_void_purchase", realm_id, request_payload, result)
     except Exception as exc:
         audit_failure("qb_void_purchase", realm_id, request_payload, exc)
+        raise
+
+
+def _purchase_line_to_flat(qb_line: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert a QB Purchase.Line dict back into the flat shape qb_update_purchase expects.
+
+    Handles both AccountBasedExpenseLineDetail (Category details in QB UI) and
+    ItemBasedExpenseLineDetail (Item details in QB UI).
+    """
+    detail_type = qb_line.get("DetailType")
+    flat: Dict[str, Any] = {
+        "amount": qb_line.get("Amount", 0),
+        "description": qb_line.get("Description", "") or "",
+    }
+    if detail_type == "ItemBasedExpenseLineDetail":
+        d = qb_line.get("ItemBasedExpenseLineDetail", {}) or {}
+        flat["item_id"] = (d.get("ItemRef") or {}).get("value")
+        if "Qty" in d:
+            flat["quantity"] = d["Qty"]
+        if "UnitPrice" in d:
+            flat["unit_price"] = d["UnitPrice"]
+    elif detail_type == "AccountBasedExpenseLineDetail":
+        d = qb_line.get("AccountBasedExpenseLineDetail", {}) or {}
+        flat["expense_account_id"] = (d.get("AccountRef") or {}).get("value")
+    else:
+        d = {}
+    if d.get("CustomerRef"):
+        flat["customer_id"] = d["CustomerRef"].get("value")
+        flat["billable"] = d.get("BillableStatus") == "Billable"
+    if d.get("ClassRef"):
+        flat["class_id"] = d["ClassRef"].get("value")
+    if d.get("TaxCodeRef"):
+        flat["tax_code_id"] = d["TaxCodeRef"].get("value")
+    return flat
+
+
+@mcp.tool()
+def qb_patch_purchase_line(
+    purchase_id: str,
+    line_index: int,
+    changes: Dict[str, Any],
+    company_ref: Optional[str] = None,
+    private_note_prefix: Optional[str] = None,
+    verify_after_update: bool = True,
+) -> Dict[str, Any]:
+    """Edit a single Line of an existing Purchase without disturbing the others.
+
+    QB's REST API has no per-line patch — sending `Line[]` replaces the whole array.
+    This wrapper does the safe read-mutate-write internally:
+
+      1. fetch the current Purchase (and its SyncToken),
+      2. normalize each existing Line into the flat shape (handles both
+         AccountBasedExpenseLineDetail = "Category details" and
+         ItemBasedExpenseLineDetail   = "Item details"),
+      3. apply `changes` to the one line at `line_index`,
+      4. call qb_update_purchase with the full reconstructed Line[]
+         (so idempotency, balance verification, and audit-note merge all apply).
+
+    line_index — zero-based index into Purchase.Line[]
+    changes    — keys to update on that one line. Supported:
+        amount, description, expense_account_id, item_id, quantity, unit_price,
+        customer_id, billable, class_id, tax_code_id.
+        Passing `expense_account_id` with `item_id=None` converts an Item line
+        into a Category line (and vice versa).
+    private_note_prefix — optional audit-trail line prepended to PrivateNote.
+    Disabled unless QB_ENABLE_PURCHASE_WRITE=true.
+    """
+    request_payload = {
+        "purchase_id": purchase_id,
+        "line_index": line_index,
+        "changes": changes,
+        "company_ref": company_ref,
+        "private_note_prefix": private_note_prefix,
+        "verify_after_update": verify_after_update,
+    }
+    realm_id = None
+    try:
+        if not SETTINGS.enable_purchase_write:
+            raise QuickBooksError("Purchase updates are disabled on this server.", status_code=403)
+        if not purchase_id:
+            raise QuickBooksError("purchase_id is required.", status_code=400)
+        if not isinstance(changes, dict) or not changes:
+            raise QuickBooksError("changes must be a non-empty object.", status_code=400)
+        if not isinstance(line_index, int) or line_index < 0:
+            raise QuickBooksError("line_index must be a non-negative integer.", status_code=400)
+        realm_id = pick_realm_id(company_ref)
+
+        existing = qb_client.request(realm_id, "GET", f"/purchase/{purchase_id}").get("Purchase", {})
+        if not existing:
+            raise QuickBooksError(f"Purchase {purchase_id} not found.", status_code=404)
+        existing_lines = existing.get("Line", []) or []
+        if line_index >= len(existing_lines):
+            raise QuickBooksError(
+                f"line_index {line_index} out of range (purchase has {len(existing_lines)} line(s)).",
+                status_code=400,
+            )
+
+        flat_lines = [_purchase_line_to_flat(ln) for ln in existing_lines]
+
+        target = flat_lines[line_index]
+        for key, value in changes.items():
+            if value is None:
+                target.pop(key, None)
+            else:
+                target[key] = value
+        if target.get("item_id") and target.get("expense_account_id"):
+            raise QuickBooksError(
+                f"Line {line_index}: cannot have both item_id and expense_account_id; "
+                "pass {item_id: null} or {expense_account_id: null} to switch types.",
+                status_code=400,
+            )
+
+        update_patch: Dict[str, Any] = {"line_items": flat_lines}
+        if private_note_prefix:
+            update_patch["private_note_prefix"] = private_note_prefix
+
+        result = qb_update_purchase(
+            purchase_id=str(purchase_id),
+            sync_token=str(existing.get("SyncToken", "0")),
+            patch=update_patch,
+            company_ref=company_ref,
+            sparse=True,
+            verify_after_update=verify_after_update,
+        )
+        result["patched_line_index"] = line_index
+        result["applied_changes"] = changes
+        return audit_success("qb_patch_purchase_line", realm_id, request_payload, result)
+    except Exception as exc:
+        audit_failure("qb_patch_purchase_line", realm_id, request_payload, exc)
         raise
 
 
