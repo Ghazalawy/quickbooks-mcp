@@ -2,6 +2,28 @@
 
 This package upgrades the local starter into a cloud-ready service you can deploy on your ERP server.
 
+**Version 2.4.0** — adds a plain HTTP `POST /upload-attachable` endpoint that
+bypasses the MCP tool-call wall entirely. Cowork / Claude Code / any client
+with the MCP bearer token can curl the file up as multipart/form-data — no
+base64 anywhere in the pipeline. Solves the "I have a 500 KB PDF locally and
+the tool-call payload budget can't fit base64 of it" problem.
+
+```
+curl -X POST https://qb-mcp.prizm-energy.com/upload-attachable \
+     -H "Authorization: Bearer $MCP_BEARER_TOKEN" \
+     -F "link_to_txn_id=20634" \
+     -F "link_to_txn_type=Purchase" \
+     -F "filename=Saudia_ETicket.pdf" \
+     -F "note=Original e-ticket (superseded)" \
+     -F "idempotency_key=cc-20634-eticket-original" \
+     -F "file=@./local-eticket.pdf"
+```
+
+Returns the same JSON shape as `qb_create_attachable` — `attachables[].Id`,
+`FileAccessUri`, `resolved_filename`, `resolved_size_bytes`, `resolved_sha256`.
+Same auth, same idempotency store, same size cap (`QB_MAX_ATTACHMENT_SIZE_BYTES`),
+same audit log.
+
 **Version 2.3.1** — adds `private_note_lines` (bullet-formatted memo) to
 `qb_create_purchase`, `qb_update_purchase` (via `patch`), and
 `qb_create_journal_entry`. Pass `["NEW YORK FRIES", "Source: CC Mar 2026",

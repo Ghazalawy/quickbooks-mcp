@@ -38,7 +38,7 @@ from starlette.routing import Mount, Route
 import uvicorn
 
 APP_NAME = "QuickBooks Online MCP Server"
-APP_VERSION = "2.3.1"  # private_note_lines bullet rendering on purchase + JE
+APP_VERSION = "2.4.0"  # POST /upload-attachable HTTP endpoint (bypass tool-call wall)
 DEFAULT_SCOPE = "com.intuit.quickbooks.accounting"
 SANDBOX_DISCOVERY = "https://developer.api.intuit.com/.well-known/openid_sandbox_configuration"
 PRODUCTION_DISCOVERY = "https://developer.api.intuit.com/.well-known/openid_configuration"
@@ -339,15 +339,21 @@ class AccessControlMiddleware(BaseHTTPMiddleware):
         # Admin pages require Basic Auth
         if path in {'/', '/status', '/auth/connect'} or path.startswith('/auth/disconnect'):
             require_admin(request)
-        # MCP endpoint — accept bearer token OR OAuth access token
-        if path.startswith('/mcp') or path.startswith('/sse'):
+        # MCP endpoint and HTTP upload endpoint — accept bearer token
+        if path.startswith('/mcp') or path.startswith('/sse') or path == '/upload-attachable':
             if SETTINGS.mcp_bearer_token:
                 auth = request.headers.get('Authorization', '')
                 if not auth.startswith('Bearer '):
-                    raise QuickBooksError('Missing bearer token for MCP endpoint.', status_code=401)
+                    return JSONResponse(
+                        {"ok": False, "error": "Missing bearer token."},
+                        status_code=401,
+                    )
                 token = auth.split(' ', 1)[1]
                 if not constant_time_equal(token, SETTINGS.mcp_bearer_token):
-                    raise QuickBooksError('Invalid MCP bearer token.', status_code=401)
+                    return JSONResponse(
+                        {"ok": False, "error": "Invalid bearer token."},
+                        status_code=401,
+                    )
         return await call_next(request)
 
 
@@ -2792,6 +2798,102 @@ async def readyz(_: Request) -> Response:
         return JSONResponse({"ok": False, "ready": False, "error": str(exc), "time": iso_now()}, status_code=500)
 
 
+async def upload_attachable_endpoint(request: Request) -> Response:
+    """HTTP multipart upload bypassing the MCP tool-call wall.
+
+    Auth: existing MCP_BEARER_TOKEN (gated in AccessControlMiddleware).
+    Body: multipart/form-data with:
+        file              required  the file bytes
+        link_to_txn_id    optional  QB entity id
+        link_to_txn_type  optional  Purchase / Bill / Invoice / JournalEntry / ...
+        filename          optional  defaults to the uploaded file's filename
+        mime              optional  defaults to the upload's Content-Type
+        note              optional  Attachable.Note
+        idempotency_key   optional
+        company_ref       optional  QB realm id (uses default if omitted)
+    Returns the same JSON shape as qb_create_attachable.
+    """
+    request_payload: Dict[str, Any] = {"endpoint": "/upload-attachable"}
+    realm_id = None
+    try:
+        if not SETTINGS.enable_attachable_write:
+            raise QuickBooksError("Attachable creation is disabled on this server.", status_code=403)
+
+        form = await request.form()
+        upload = form.get("file")
+        if upload is None or not hasattr(upload, "read"):
+            raise QuickBooksError("`file` multipart part is required.", status_code=400)
+
+        link_to_txn_id = (form.get("link_to_txn_id") or "").strip() or None
+        link_to_txn_type = (form.get("link_to_txn_type") or "").strip() or None
+        explicit_filename = (form.get("filename") or "").strip() or None
+        explicit_mime = (form.get("mime") or "").strip() or None
+        note = form.get("note") or ""
+        idempotency_key = (form.get("idempotency_key") or "").strip() or None
+        company_ref = (form.get("company_ref") or "").strip() or None
+        request_payload.update({
+            "link_to_txn_id": link_to_txn_id,
+            "link_to_txn_type": link_to_txn_type,
+            "filename": explicit_filename,
+            "mime": explicit_mime,
+            "note": note,
+            "idempotency_key": idempotency_key,
+            "company_ref": company_ref,
+            "upload_filename": getattr(upload, "filename", None),
+        })
+
+        _validate_link_target(link_to_txn_id, link_to_txn_type)
+        realm_id = pick_realm_id(company_ref)
+
+        max_bytes = SETTINGS.max_attachment_size_bytes
+        chunks: List[bytes] = []
+        total = 0
+        while True:
+            chunk = await upload.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise QuickBooksError(
+                    f"Attachment exceeds limit {max_bytes} bytes.",
+                    status_code=413,
+                )
+            chunks.append(chunk)
+        file_bytes = b"".join(chunks)
+
+        fallback_filename = getattr(upload, "filename", None) or "upload"
+        fallback_mime = getattr(upload, "content_type", None) or _guess_mime_from_filename(fallback_filename)
+
+        result = _create_attachable_core(
+            tool_name="http_upload_attachable",
+            realm_id=realm_id,
+            file_bytes=file_bytes,
+            filename=explicit_filename,
+            mime=explicit_mime,
+            fallback_filename=fallback_filename,
+            fallback_mime=fallback_mime,
+            link_to_txn_id=link_to_txn_id,
+            link_to_txn_type=link_to_txn_type,
+            note=note,
+            idempotency_key=idempotency_key,
+            request_payload=request_payload,
+        )
+        return JSONResponse(result)
+    except QuickBooksError as exc:
+        audit_failure("http_upload_attachable", realm_id, request_payload, exc)
+        return JSONResponse(
+            {"error": str(exc), "status_code": exc.status_code, "payload": exc.payload},
+            status_code=exc.status_code,
+        )
+    except Exception as exc:
+        audit_failure("http_upload_attachable", realm_id, request_payload, exc)
+        logger.exception("Unhandled error in /upload-attachable")
+        return JSONResponse(
+            {"error": "Internal server error.", "detail": str(exc)},
+            status_code=500,
+        )
+
+
 STATUS_TEMPLATE = """
 <!doctype html>
 <html>
@@ -3050,6 +3152,7 @@ custom_routes = [
     Route("/status", endpoint=status_page, methods=["GET"]),
     Route("/healthz", endpoint=healthz, methods=["GET"]),
     Route("/readyz", endpoint=readyz, methods=["GET"]),
+    Route("/upload-attachable", endpoint=upload_attachable_endpoint, methods=["POST"]),
     Route("/auth/connect", endpoint=oauth_connect, methods=["GET"]),
     Route("/auth/callback", endpoint=oauth_callback, methods=["GET"]),
     Route("/auth/disconnect", endpoint=oauth_disconnect, methods=["POST"]),
