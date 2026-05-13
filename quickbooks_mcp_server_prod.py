@@ -38,7 +38,7 @@ from starlette.routing import Mount, Route
 import uvicorn
 
 APP_NAME = "QuickBooks Online MCP Server"
-APP_VERSION = "2.3.0"  # split attachable tools + department_id on purchase
+APP_VERSION = "2.3.1"  # private_note_lines bullet rendering on purchase + JE
 DEFAULT_SCOPE = "com.intuit.quickbooks.accounting"
 SANDBOX_DISCOVERY = "https://developer.api.intuit.com/.well-known/openid_sandbox_configuration"
 PRODUCTION_DISCOVERY = "https://developer.api.intuit.com/.well-known/openid_configuration"
@@ -91,6 +91,7 @@ class Settings:
     attachable_url_allow_http: bool = os.getenv("QB_ATTACHABLE_URL_ALLOW_HTTP", "false").strip().lower() in {"1", "true", "yes", "on"}
     graph_base_url: str = os.getenv("QB_GRAPH_BASE_URL", "https://graph.microsoft.com/v1.0").strip().rstrip("/")
     graph_access_token_env: str = os.getenv("QB_GRAPH_ACCESS_TOKEN", "").strip()
+    memo_bullet_prefix: str = os.getenv("QB_MEMO_BULLET_PREFIX", "• ")
     require_idempotency_key: bool = os.getenv("QB_REQUIRE_IDEMPOTENCY_KEY", "true").strip().lower() in {"1", "true", "yes", "on"}
 
     status_page_enabled: bool = os.getenv("STATUS_PAGE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -1174,6 +1175,28 @@ def qb_create_invoice(
 _VALID_PAYMENT_TYPES = {"Cash", "Check", "CreditCard"}
 
 
+def _join_note_lines(lines: List[str]) -> str:
+    """Render a list of memo lines into a bullet-point block.
+
+    Bullet character is QB_MEMO_BULLET_PREFIX (default '• '). Empty / None
+    entries are skipped. Lines that already start with a bullet-like char
+    have it stripped first so we never double up.
+    """
+    if not lines:
+        return ""
+    bullet = SETTINGS.memo_bullet_prefix or "• "
+    cleaned: List[str] = []
+    for ln in lines:
+        if ln is None:
+            continue
+        s = str(ln).strip().lstrip("•·*-").lstrip()
+        if s:
+            cleaned.append(s)
+    if not cleaned:
+        return ""
+    return "\n".join(f"{bullet}{ln}" for ln in cleaned)
+
+
 def _build_purchase_line(idx: int, item: Dict[str, Any]) -> Dict[str, Any]:
     """Build a Purchase Line from a flat dict.
 
@@ -1251,6 +1274,7 @@ def qb_create_purchase(
     payment_method_id: Optional[str] = None,
     doc_number: Optional[str] = None,
     private_note: str = "",
+    private_note_lines: Optional[List[str]] = None,
     currency: Optional[str] = None,
     exchange_rate: Optional[float] = None,
     department_id: Optional[str] = None,
@@ -1265,6 +1289,10 @@ def qb_create_purchase(
         Item-based (set item_id): {amount, item_id, quantity?, unit_price?, description?, customer_id?, billable?, class_id?, tax_code_id?}
     vendor_id     — optional EntityRef (payee) for the purchase.
     department_id — optional DepartmentRef (Location in QB UI; cost-centre tag).
+    private_note  — paragraph memo (REPLACES any existing).
+    private_note_lines — list of strings rendered as bullet points in the memo;
+                  joined with QB_MEMO_BULLET_PREFIX (default '• ') and newlines.
+                  Mutually exclusive with private_note. Skips empty entries.
     Disabled unless QB_ENABLE_PURCHASE_WRITE=true.
     """
     request_payload = {
@@ -1277,6 +1305,7 @@ def qb_create_purchase(
         "payment_method_id": payment_method_id,
         "doc_number": doc_number,
         "private_note": private_note,
+        "private_note_lines": private_note_lines,
         "currency": currency,
         "exchange_rate": exchange_rate,
         "department_id": department_id,
@@ -1293,6 +1322,13 @@ def qb_create_purchase(
             )
         if not line_items:
             raise QuickBooksError("At least one line item is required.", status_code=400)
+        if private_note and private_note_lines:
+            raise QuickBooksError(
+                "Pass either private_note (paragraph) or private_note_lines (bullets), not both.",
+                status_code=400,
+            )
+        if private_note_lines:
+            private_note = _join_note_lines(private_note_lines)
         realm_id = pick_realm_id(company_ref)
         if SETTINGS.require_idempotency_key and not idempotency_key:
             raise QuickBooksError("idempotency_key is required for purchase creation.", status_code=400)
@@ -1393,10 +1429,13 @@ def qb_update_purchase(
         txn_date, doc_number, vendor_id, payment_method_id,
         payment_type, account_id, currency, exchange_rate, line_items,
         department_id        — sets DepartmentRef (Location).
-        private_note         — REPLACES the existing PrivateNote.
+        private_note         — REPLACES the existing PrivateNote (paragraph form).
+        private_note_lines   — list of strings rendered as bullet points; REPLACES the
+                               existing PrivateNote. Joined with QB_MEMO_BULLET_PREFIX.
+                               Mutually exclusive with private_note and private_note_prefix.
         private_note_prefix  — READS existing PrivateNote, prepends this string + newline,
                                then writes the merged value. Safe for audit-trail annotations.
-                               Cannot be combined with private_note.
+                               Cannot be combined with private_note / private_note_lines.
         (line_items uses the same shape as qb_create_purchase; REPLACES all lines —
          QB's API has no per-line patch, so the caller must pass the full Line[] array)
     sparse              — if true (default), only listed top-level fields are updated.
@@ -1421,9 +1460,12 @@ def qb_update_purchase(
             raise QuickBooksError("purchase_id and sync_token are required.", status_code=400)
         if not isinstance(patch, dict) or not patch:
             raise QuickBooksError("patch must be a non-empty object.", status_code=400)
-        if "private_note" in patch and "private_note_prefix" in patch:
+        note_modes_set = sum(
+            1 for k in ("private_note", "private_note_prefix", "private_note_lines") if k in patch
+        )
+        if note_modes_set > 1:
             raise QuickBooksError(
-                "Pass either private_note (replace) or private_note_prefix (merge), not both.",
+                "patch may include only ONE of private_note / private_note_prefix / private_note_lines.",
                 status_code=400,
             )
         realm_id = pick_realm_id(company_ref)
@@ -1449,6 +1491,8 @@ def qb_update_purchase(
             payload["TxnDate"] = patch["txn_date"]
         if "private_note" in patch:
             payload["PrivateNote"] = patch["private_note"] or ""
+        if "private_note_lines" in patch and patch["private_note_lines"] is not None:
+            payload["PrivateNote"] = _join_note_lines(list(patch["private_note_lines"]))
         if "private_note_prefix" in patch and patch["private_note_prefix"]:
             existing_purchase = qb_client.request(realm_id, "GET", f"/purchase/{purchase_id}").get("Purchase", {})
             existing_note = (existing_purchase.get("PrivateNote") or "").strip()
@@ -1683,6 +1727,7 @@ def qb_create_journal_entry(
     company_ref: Optional[str] = None,
     doc_number: Optional[str] = None,
     private_note: str = "",
+    private_note_lines: Optional[List[str]] = None,
     currency: Optional[str] = None,
     exchange_rate: Optional[float] = None,
     adjustment: bool = False,
@@ -1695,6 +1740,9 @@ def qb_create_journal_entry(
          entity_id?, entity_type? ("Customer"|"Vendor"|"Employee"),
          class_id?, department_id?}
         Sum of Debits must equal sum of Credits.
+    private_note       — paragraph memo.
+    private_note_lines — list of strings rendered as bullet points; joined with
+                         QB_MEMO_BULLET_PREFIX. Mutually exclusive with private_note.
     adjustment — set true to mark as an adjusting journal entry.
     Disabled unless QB_ENABLE_JOURNAL_WRITE=true.
     """
@@ -1704,6 +1752,7 @@ def qb_create_journal_entry(
         "company_ref": company_ref,
         "doc_number": doc_number,
         "private_note": private_note,
+        "private_note_lines": private_note_lines,
         "currency": currency,
         "exchange_rate": exchange_rate,
         "adjustment": adjustment,
@@ -1715,6 +1764,13 @@ def qb_create_journal_entry(
             raise QuickBooksError("Journal entry creation is disabled on this server.", status_code=403)
         if not line_items or len(line_items) < 2:
             raise QuickBooksError("A journal entry requires at least two lines.", status_code=400)
+        if private_note and private_note_lines:
+            raise QuickBooksError(
+                "Pass either private_note (paragraph) or private_note_lines (bullets), not both.",
+                status_code=400,
+            )
+        if private_note_lines:
+            private_note = _join_note_lines(private_note_lines)
         realm_id = pick_realm_id(company_ref)
         if SETTINGS.require_idempotency_key and not idempotency_key:
             raise QuickBooksError("idempotency_key is required for journal entry creation.", status_code=400)

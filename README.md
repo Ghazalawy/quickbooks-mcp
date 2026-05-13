@@ -2,6 +2,22 @@
 
 This package upgrades the local starter into a cloud-ready service you can deploy on your ERP server.
 
+**Version 2.3.1** — adds `private_note_lines` (bullet-formatted memo) to
+`qb_create_purchase`, `qb_update_purchase` (via `patch`), and
+`qb_create_journal_entry`. Pass `["NEW YORK FRIES", "Source: CC Mar 2026",
+"Cat: 6116 Utilities"]` and the QB Memo renders as:
+
+```
+• NEW YORK FRIES
+• Source: CC Mar 2026
+• Cat: 6116 Utilities
+```
+
+Bullet char configurable via `QB_MEMO_BULLET_PREFIX` (default `• `). Empty
+entries are skipped, leading `• · - *` chars stripped so existing bullets
+don't double up. Mutually exclusive with `private_note` (paragraph) and
+`private_note_prefix` (audit-merge).
+
 **Version 2.3.0** — 70 tools. Three changes:
 
 1. Two focused attachable tools that never base64-encode the file:

@@ -110,7 +110,13 @@ def captured_qb_json(monkeypatch, server):
             body = dict(json_body or {})
             body.setdefault("Id", "20634")
             body.setdefault("SyncToken", "1")
+            body.setdefault("TotalAmt", sum(float(ln.get("Amount", 0)) for ln in body.get("Line", []) or []))
             return {"Purchase": body}
+        if path.startswith("/journalentry"):
+            body = dict(json_body or {})
+            body.setdefault("Id", "30001")
+            body.setdefault("SyncToken", "0")
+            return {"JournalEntry": body}
         return {}
 
     monkeypatch.setattr(m.qb_client, "request", _stub_request)
