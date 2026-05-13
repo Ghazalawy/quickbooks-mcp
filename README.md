@@ -2,19 +2,21 @@
 
 This package upgrades the local starter into a cloud-ready service you can deploy on your ERP server.
 
-**Version 2.2.0** — 68 tools. `qb_create_attachable` now accepts four mutually
-exclusive source modes (pick one):
+**Version 2.3.0** — 70 tools. Three changes:
 
-| Mode | Use when |
-| --- | --- |
-| `file_bytes_b64` | small files where inline base64 fits the MCP-call budget |
-| `file_path` | file already lives on the MCP server (must be under `QB_ATTACHABLE_UPLOAD_DIR`) |
-| `file_url` | file is reachable via http(s); MCP streams it (use `file_url_auth_header` for protected URLs) |
-| `from_email_attachment` | `{mailbox, email_id, attachment_id, graph_access_token}` — MCP calls Microsoft Graph and streams the attachment straight into QB, skipping the base64 round-trip entirely |
+1. Two focused attachable tools that never base64-encode the file:
+   - `qb_create_attachable_from_email(mailbox, email_id, attachment_id, ...)` — streams Microsoft Graph → QB
+   - `qb_create_attachable_from_path(file_path, ...)` — streams local file → QB
+2. `qb_create_purchase` and `qb_update_purchase` now accept `department_id` (sets `DepartmentRef`, a.k.a. Location).
+3. `file_path` uploads are constrained by `QB_ATTACHABLE_PATH_ALLOWLIST` — comma-separated glob patterns
+   (e.g. `/opt/quickbooks-mcp/uploads,/sessions/*/mnt/Financial`). Falls back to the legacy
+   `QB_ATTACHABLE_UPLOAD_DIR` if the allowlist env var is unset.
 
-`filename` and `mime` are now optional — auto-derived from filesystem extension,
-HTTP `Content-Disposition` / `Content-Type`, or Graph attachment metadata.
-The `graph_access_token` is redacted from the audit log before persistence.
+The legacy `qb_create_attachable` multi-source tool stays — useful when callers
+need to inline small base64 blobs without a Graph credential.
+
+Pytest suite under `tests/` covers all of the above and runs offline (mocked
+Graph + QB endpoints). Run with `pip install -r tests/requirements.txt && pytest tests/`.
 
 Earlier in 2.1: `qb_create_purchase`, `qb_update_purchase`, `qb_patch_purchase_line`,
 `qb_void_purchase`, `qb_create_journal_entry`.
@@ -169,7 +171,9 @@ Write tools (each off by default — set the matching flag to `true` to enable):
 | `qb_patch_purchase_line` | `QB_ENABLE_PURCHASE_WRITE` | Edit one Line of a Purchase by index (read-mutate-write; preserves all other lines, both Category and Item details) |
 | `qb_void_purchase` | `QB_ENABLE_PURCHASE_WRITE` | Delete a purchase (QB has no `void` op on Purchase — uses `operation=delete` for rollback) |
 | `qb_create_journal_entry` | `QB_ENABLE_JOURNAL_WRITE` | Create a balanced journal entry (debits == credits) |
-| `qb_create_attachable` | `QB_ENABLE_ATTACHABLE_WRITE` | Upload a file and optionally link it to a transaction or entity |
+| `qb_create_attachable` | `QB_ENABLE_ATTACHABLE_WRITE` | Multi-source upload (inline b64 / local path / URL / Graph email attachment) |
+| `qb_create_attachable_from_email` | `QB_ENABLE_ATTACHABLE_WRITE` | Stream an Outlook attachment from Microsoft Graph straight into QB — no base64 round-trip |
+| `qb_create_attachable_from_path` | `QB_ENABLE_ATTACHABLE_WRITE` | Stream a local file (inside `QB_ATTACHABLE_PATH_ALLOWLIST`) straight into QB |
 
 ## Write-safety rules in this package
 Every write tool is guarded by:
