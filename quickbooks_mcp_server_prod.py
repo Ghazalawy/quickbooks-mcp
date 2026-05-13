@@ -37,7 +37,7 @@ from starlette.routing import Mount, Route
 import uvicorn
 
 APP_NAME = "QuickBooks Online MCP Server"
-APP_VERSION = "2.0.0"  # 62 tools, production-ready
+APP_VERSION = "2.1.0"  # 67 tools — adds purchase/journal/attachable writes
 DEFAULT_SCOPE = "com.intuit.quickbooks.accounting"
 SANDBOX_DISCOVERY = "https://developer.api.intuit.com/.well-known/openid_sandbox_configuration"
 PRODUCTION_DISCOVERY = "https://developer.api.intuit.com/.well-known/openid_configuration"
@@ -78,7 +78,13 @@ class Settings:
     retry_attempts: int = int(os.getenv("QB_RETRY_ATTEMPTS", "3").strip())
 
     enable_invoice_write: bool = os.getenv("QB_ENABLE_INVOICE_WRITE", "false").strip().lower() in {"1", "true", "yes", "on"}
+    enable_purchase_write: bool = os.getenv("QB_ENABLE_PURCHASE_WRITE", "false").strip().lower() in {"1", "true", "yes", "on"}
+    enable_journal_write: bool = os.getenv("QB_ENABLE_JOURNAL_WRITE", "false").strip().lower() in {"1", "true", "yes", "on"}
+    enable_attachable_write: bool = os.getenv("QB_ENABLE_ATTACHABLE_WRITE", "false").strip().lower() in {"1", "true", "yes", "on"}
     max_invoice_total: str = os.getenv("QB_MAX_INVOICE_TOTAL", "50000.00").strip()
+    max_purchase_total: str = os.getenv("QB_MAX_PURCHASE_TOTAL", "50000.00").strip()
+    max_journal_total: str = os.getenv("QB_MAX_JOURNAL_TOTAL", "100000.00").strip()
+    max_attachment_size_bytes: int = int(os.getenv("QB_MAX_ATTACHMENT_SIZE_BYTES", "10485760").strip())
     require_idempotency_key: bool = os.getenv("QB_REQUIRE_IDEMPOTENCY_KEY", "true").strip().lower() in {"1", "true", "yes", "on"}
 
     status_page_enabled: bool = os.getenv("STATUS_PAGE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -111,6 +117,14 @@ class Settings:
     @property
     def max_invoice_total_decimal(self) -> Decimal:
         return Decimal(self.max_invoice_total)
+
+    @property
+    def max_purchase_total_decimal(self) -> Decimal:
+        return Decimal(self.max_purchase_total)
+
+    @property
+    def max_journal_total_decimal(self) -> Decimal:
+        return Decimal(self.max_journal_total)
 
 
 SETTINGS = Settings()
@@ -702,6 +716,42 @@ class QuickBooksClient:
     def query(self, realm_id: str, statement: str) -> Dict[str, Any]:
         return self.request(realm_id, "POST", "/query", data=statement, content_type="application/text")
 
+    def upload_multipart(
+        self,
+        realm_id: str,
+        path: str,
+        files: List[Any],
+    ) -> Dict[str, Any]:
+        """POST multipart form to QB. `files` is the list passed to requests.post(files=...)."""
+        conn = ensure_fresh_connection(realm_id)
+        url = f"{SETTINGS.api_base_url}/v3/company/{realm_id}{path}"
+        attempts = max(1, SETTINGS.retry_attempts)
+        last_error: Optional[QuickBooksError] = None
+        for attempt in range(1, attempts + 1):
+            headers = {
+                "Authorization": f"Bearer {conn['access_token']}",
+                "Accept": "application/json",
+            }
+            resp = requests.post(url, headers=headers, files=files, timeout=SETTINGS.request_timeout_seconds)
+            if resp.status_code == 401:
+                conn = refresh_access_token(realm_id)
+                headers["Authorization"] = f"Bearer {conn['access_token']}"
+                resp = requests.post(url, headers=headers, files=files, timeout=SETTINGS.request_timeout_seconds)
+            if resp.status_code < 400:
+                return resp.json() if resp.text else {}
+            message = parse_qb_error(resp)
+            last_error = QuickBooksError(
+                f"QuickBooks API error {resp.status_code}: {message}",
+                status_code=resp.status_code,
+            )
+            if resp.status_code in {429, 500, 502, 503, 504} and attempt < attempts:
+                time.sleep(min(2 ** (attempt - 1), 5))
+                continue
+            raise last_error
+        if last_error:
+            raise last_error
+        raise QuickBooksError("Unknown QuickBooks client failure.", status_code=500)
+
 
 qb_client = QuickBooksClient()
 
@@ -1096,6 +1146,593 @@ def qb_create_invoice(
     except Exception as exc:
         audit_failure("qb_create_invoice", realm_id, request_payload, exc)
         raise
+
+
+# ─────────────────────────────────────────────────────────
+# WRITE TOOLS — Purchases, Journal Entries, Attachables
+# All gated by per-feature enable flags; all audit-logged.
+# ─────────────────────────────────────────────────────────
+
+
+_VALID_PAYMENT_TYPES = {"Cash", "Check", "CreditCard"}
+
+
+def _build_purchase_line(idx: int, item: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a Purchase Line from a flat dict.
+
+    Account-based (default):  {amount, expense_account_id, description?, customer_id?, billable?, class_id?, tax_code_id?}
+    Item-based (if item_id):  {amount, item_id, quantity?, unit_price?, description?, customer_id?, billable?, class_id?, tax_code_id?}
+    """
+    try:
+        amount = Decimal(str(item["amount"]))
+    except (KeyError, InvalidOperation) as exc:
+        raise QuickBooksError(f"Line {idx}: 'amount' is required and must be numeric.", status_code=400) from exc
+
+    description = str(item.get("description", "") or "")
+    line: Dict[str, Any] = {"Amount": float(amount), "Description": description}
+
+    if item.get("item_id"):
+        detail: Dict[str, Any] = {"ItemRef": {"value": str(item["item_id"])}}
+        if "quantity" in item and item["quantity"] is not None:
+            try:
+                detail["Qty"] = float(Decimal(str(item["quantity"])))
+            except InvalidOperation as exc:
+                raise QuickBooksError(f"Line {idx}: invalid quantity.", status_code=400) from exc
+        if "unit_price" in item and item["unit_price"] is not None:
+            try:
+                detail["UnitPrice"] = float(Decimal(str(item["unit_price"])))
+            except InvalidOperation as exc:
+                raise QuickBooksError(f"Line {idx}: invalid unit_price.", status_code=400) from exc
+        if item.get("customer_id"):
+            detail["CustomerRef"] = {"value": str(item["customer_id"])}
+            detail["BillableStatus"] = "Billable" if item.get("billable") else "NotBillable"
+        if item.get("class_id"):
+            detail["ClassRef"] = {"value": str(item["class_id"])}
+        if item.get("tax_code_id"):
+            detail["TaxCodeRef"] = {"value": str(item["tax_code_id"])}
+        line["DetailType"] = "ItemBasedExpenseLineDetail"
+        line["ItemBasedExpenseLineDetail"] = detail
+    else:
+        account_id = item.get("expense_account_id") or item.get("account_id")
+        if not account_id:
+            raise QuickBooksError(
+                f"Line {idx}: account-based lines require 'expense_account_id'.",
+                status_code=400,
+            )
+        detail = {"AccountRef": {"value": str(account_id)}}
+        if item.get("customer_id"):
+            detail["CustomerRef"] = {"value": str(item["customer_id"])}
+            detail["BillableStatus"] = "Billable" if item.get("billable") else "NotBillable"
+        if item.get("class_id"):
+            detail["ClassRef"] = {"value": str(item["class_id"])}
+        if item.get("tax_code_id"):
+            detail["TaxCodeRef"] = {"value": str(item["tax_code_id"])}
+        line["DetailType"] = "AccountBasedExpenseLineDetail"
+        line["AccountBasedExpenseLineDetail"] = detail
+
+    return line
+
+
+def _purchase_total_from_lines(line_items: List[Dict[str, Any]]) -> Decimal:
+    total = Decimal("0")
+    for line in line_items:
+        try:
+            total += Decimal(str(line["amount"]))
+        except (KeyError, InvalidOperation) as exc:
+            raise QuickBooksError("Each purchase line requires a numeric 'amount'.", status_code=400) from exc
+    return total
+
+
+@mcp.tool()
+def qb_create_purchase(
+    payment_type: str,
+    account_id: str,
+    line_items: List[Dict[str, Any]],
+    txn_date: Optional[str] = None,
+    company_ref: Optional[str] = None,
+    vendor_id: Optional[str] = None,
+    payment_method_id: Optional[str] = None,
+    doc_number: Optional[str] = None,
+    private_note: str = "",
+    currency: Optional[str] = None,
+    exchange_rate: Optional[float] = None,
+    idempotency_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create a Purchase transaction (Cash / Check / CreditCard expense).
+
+    payment_type  — "Cash" | "Check" | "CreditCard"
+    account_id    — ID of the bank or credit-card account funding the purchase (AccountRef)
+    line_items    — list of expense lines. Each item is:
+        Account-based (default): {amount, expense_account_id, description?, customer_id?, billable?, class_id?, tax_code_id?}
+        Item-based (set item_id): {amount, item_id, quantity?, unit_price?, description?, customer_id?, billable?, class_id?, tax_code_id?}
+    vendor_id     — optional EntityRef (payee) for the purchase.
+    Disabled unless QB_ENABLE_PURCHASE_WRITE=true.
+    """
+    request_payload = {
+        "payment_type": payment_type,
+        "account_id": account_id,
+        "line_items": line_items,
+        "txn_date": txn_date,
+        "company_ref": company_ref,
+        "vendor_id": vendor_id,
+        "payment_method_id": payment_method_id,
+        "doc_number": doc_number,
+        "private_note": private_note,
+        "currency": currency,
+        "exchange_rate": exchange_rate,
+        "idempotency_key": idempotency_key,
+    }
+    realm_id = None
+    try:
+        if not SETTINGS.enable_purchase_write:
+            raise QuickBooksError("Purchase creation is disabled on this server.", status_code=403)
+        if payment_type not in _VALID_PAYMENT_TYPES:
+            raise QuickBooksError(
+                f"payment_type must be one of {sorted(_VALID_PAYMENT_TYPES)}.",
+                status_code=400,
+            )
+        if not line_items:
+            raise QuickBooksError("At least one line item is required.", status_code=400)
+        realm_id = pick_realm_id(company_ref)
+        if SETTINGS.require_idempotency_key and not idempotency_key:
+            raise QuickBooksError("idempotency_key is required for purchase creation.", status_code=400)
+
+        estimated_total = _purchase_total_from_lines(line_items)
+        if estimated_total > SETTINGS.max_purchase_total_decimal:
+            raise QuickBooksError(
+                f"Purchase total {estimated_total} exceeds configured limit {SETTINGS.max_purchase_total_decimal}.",
+                status_code=400,
+            )
+
+        request_hash = compute_request_hash({k: v for k, v in request_payload.items() if k != "idempotency_key"})
+        if idempotency_key:
+            existing = IdempotencyStore.get(idempotency_key)
+            if existing:
+                if existing["tool_name"] != "qb_create_purchase" or existing["request_hash"] != request_hash:
+                    raise QuickBooksError(
+                        "idempotency_key has already been used with a different request.",
+                        status_code=409,
+                    )
+                return audit_success("qb_create_purchase", realm_id, request_payload, existing["response"])
+
+        lines = [_build_purchase_line(idx, item) for idx, item in enumerate(line_items, start=1)]
+
+        payload: Dict[str, Any] = {
+            "PaymentType": payment_type,
+            "AccountRef": {"value": str(account_id)},
+            "Line": lines,
+        }
+        if txn_date:
+            payload["TxnDate"] = txn_date
+        if vendor_id:
+            payload["EntityRef"] = {"value": str(vendor_id), "type": "Vendor"}
+        if payment_method_id:
+            payload["PaymentMethodRef"] = {"value": str(payment_method_id)}
+        if doc_number:
+            payload["DocNumber"] = str(doc_number)
+        if private_note:
+            payload["PrivateNote"] = private_note
+        if currency:
+            payload["CurrencyRef"] = {"value": currency}
+        if exchange_rate is not None:
+            payload["ExchangeRate"] = float(exchange_rate)
+
+        response = qb_client.request(realm_id, "POST", "/purchase", json_body=payload)
+        result = {"realm_id": realm_id, "purchase": response.get("Purchase", response)}
+        if idempotency_key:
+            try:
+                IdempotencyStore.put(idempotency_key, "qb_create_purchase", request_hash, result)
+            except IntegrityError:
+                pass
+        return audit_success("qb_create_purchase", realm_id, request_payload, result)
+    except Exception as exc:
+        audit_failure("qb_create_purchase", realm_id, request_payload, exc)
+        raise
+
+
+@mcp.tool()
+def qb_update_purchase(
+    purchase_id: str,
+    sync_token: str,
+    patch: Dict[str, Any],
+    company_ref: Optional[str] = None,
+    sparse: bool = True,
+) -> Dict[str, Any]:
+    """Update an existing Purchase (sparse update by default).
+
+    purchase_id  — QuickBooks Purchase.Id
+    sync_token   — Purchase.SyncToken from the latest read (required for optimistic locking)
+    patch        — fields to update. Supported keys:
+        txn_date, private_note, doc_number, vendor_id, payment_method_id,
+        payment_type, account_id, currency, exchange_rate, line_items
+        (line_items uses the same shape as qb_create_purchase; replaces all lines)
+    sparse       — if true (default), only the listed fields are updated; otherwise full overwrite.
+    Disabled unless QB_ENABLE_PURCHASE_WRITE=true.
+    """
+    request_payload = {
+        "purchase_id": purchase_id,
+        "sync_token": sync_token,
+        "patch": patch,
+        "company_ref": company_ref,
+        "sparse": sparse,
+    }
+    realm_id = None
+    try:
+        if not SETTINGS.enable_purchase_write:
+            raise QuickBooksError("Purchase updates are disabled on this server.", status_code=403)
+        if not purchase_id or sync_token is None:
+            raise QuickBooksError("purchase_id and sync_token are required.", status_code=400)
+        if not isinstance(patch, dict) or not patch:
+            raise QuickBooksError("patch must be a non-empty object.", status_code=400)
+        realm_id = pick_realm_id(company_ref)
+
+        payload: Dict[str, Any] = {
+            "Id": str(purchase_id),
+            "SyncToken": str(sync_token),
+        }
+        if sparse:
+            payload["sparse"] = True
+
+        if "payment_type" in patch:
+            pt = patch["payment_type"]
+            if pt not in _VALID_PAYMENT_TYPES:
+                raise QuickBooksError(
+                    f"payment_type must be one of {sorted(_VALID_PAYMENT_TYPES)}.",
+                    status_code=400,
+                )
+            payload["PaymentType"] = pt
+        if "account_id" in patch and patch["account_id"]:
+            payload["AccountRef"] = {"value": str(patch["account_id"])}
+        if "txn_date" in patch and patch["txn_date"]:
+            payload["TxnDate"] = patch["txn_date"]
+        if "private_note" in patch:
+            payload["PrivateNote"] = patch["private_note"] or ""
+        if "doc_number" in patch:
+            payload["DocNumber"] = str(patch["doc_number"] or "")
+        if "vendor_id" in patch:
+            if patch["vendor_id"]:
+                payload["EntityRef"] = {"value": str(patch["vendor_id"]), "type": "Vendor"}
+            else:
+                payload["EntityRef"] = None
+        if "payment_method_id" in patch and patch["payment_method_id"]:
+            payload["PaymentMethodRef"] = {"value": str(patch["payment_method_id"])}
+        if "currency" in patch and patch["currency"]:
+            payload["CurrencyRef"] = {"value": patch["currency"]}
+        if "exchange_rate" in patch and patch["exchange_rate"] is not None:
+            payload["ExchangeRate"] = float(patch["exchange_rate"])
+        if "line_items" in patch and patch["line_items"] is not None:
+            new_lines = patch["line_items"]
+            if not isinstance(new_lines, list) or not new_lines:
+                raise QuickBooksError("patch.line_items must be a non-empty list.", status_code=400)
+            estimated_total = _purchase_total_from_lines(new_lines)
+            if estimated_total > SETTINGS.max_purchase_total_decimal:
+                raise QuickBooksError(
+                    f"Purchase total {estimated_total} exceeds configured limit {SETTINGS.max_purchase_total_decimal}.",
+                    status_code=400,
+                )
+            payload["Line"] = [_build_purchase_line(idx, item) for idx, item in enumerate(new_lines, start=1)]
+
+        response = qb_client.request(realm_id, "POST", "/purchase", json_body=payload)
+        result = {"realm_id": realm_id, "purchase": response.get("Purchase", response)}
+        return audit_success("qb_update_purchase", realm_id, request_payload, result)
+    except Exception as exc:
+        audit_failure("qb_update_purchase", realm_id, request_payload, exc)
+        raise
+
+
+@mcp.tool()
+def qb_void_purchase(
+    purchase_id: str,
+    sync_token: str,
+    company_ref: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Void (delete) a Purchase. QuickBooks does not support `operation=void` on Purchase,
+    so this performs a hard delete (`operation=delete`) which is the QB-supported rollback path.
+
+    purchase_id — QuickBooks Purchase.Id
+    sync_token  — current Purchase.SyncToken for optimistic locking
+    Disabled unless QB_ENABLE_PURCHASE_WRITE=true.
+    """
+    request_payload = {
+        "purchase_id": purchase_id,
+        "sync_token": sync_token,
+        "company_ref": company_ref,
+    }
+    realm_id = None
+    try:
+        if not SETTINGS.enable_purchase_write:
+            raise QuickBooksError("Purchase deletion is disabled on this server.", status_code=403)
+        if not purchase_id or sync_token is None:
+            raise QuickBooksError("purchase_id and sync_token are required.", status_code=400)
+        realm_id = pick_realm_id(company_ref)
+
+        payload = {"Id": str(purchase_id), "SyncToken": str(sync_token)}
+        response = qb_client.request(
+            realm_id,
+            "POST",
+            "/purchase",
+            params={"operation": "delete"},
+            json_body=payload,
+        )
+        result = {"realm_id": realm_id, "deleted": response.get("Purchase", response)}
+        return audit_success("qb_void_purchase", realm_id, request_payload, result)
+    except Exception as exc:
+        audit_failure("qb_void_purchase", realm_id, request_payload, exc)
+        raise
+
+
+@mcp.tool()
+def qb_create_journal_entry(
+    line_items: List[Dict[str, Any]],
+    txn_date: Optional[str] = None,
+    company_ref: Optional[str] = None,
+    doc_number: Optional[str] = None,
+    private_note: str = "",
+    currency: Optional[str] = None,
+    exchange_rate: Optional[float] = None,
+    adjustment: bool = False,
+    idempotency_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create a balanced Journal Entry.
+
+    line_items — list of journal lines, each:
+        {amount, posting_type ("Debit"|"Credit"), account_id, description?,
+         entity_id?, entity_type? ("Customer"|"Vendor"|"Employee"),
+         class_id?, department_id?}
+        Sum of Debits must equal sum of Credits.
+    adjustment — set true to mark as an adjusting journal entry.
+    Disabled unless QB_ENABLE_JOURNAL_WRITE=true.
+    """
+    request_payload = {
+        "line_items": line_items,
+        "txn_date": txn_date,
+        "company_ref": company_ref,
+        "doc_number": doc_number,
+        "private_note": private_note,
+        "currency": currency,
+        "exchange_rate": exchange_rate,
+        "adjustment": adjustment,
+        "idempotency_key": idempotency_key,
+    }
+    realm_id = None
+    try:
+        if not SETTINGS.enable_journal_write:
+            raise QuickBooksError("Journal entry creation is disabled on this server.", status_code=403)
+        if not line_items or len(line_items) < 2:
+            raise QuickBooksError("A journal entry requires at least two lines.", status_code=400)
+        realm_id = pick_realm_id(company_ref)
+        if SETTINGS.require_idempotency_key and not idempotency_key:
+            raise QuickBooksError("idempotency_key is required for journal entry creation.", status_code=400)
+
+        debit_total = Decimal("0")
+        credit_total = Decimal("0")
+        lines: List[Dict[str, Any]] = []
+        for idx, item in enumerate(line_items, start=1):
+            try:
+                amount = Decimal(str(item["amount"]))
+            except (KeyError, InvalidOperation) as exc:
+                raise QuickBooksError(f"JE line {idx}: 'amount' is required and must be numeric.", status_code=400) from exc
+            posting_type = item.get("posting_type")
+            if posting_type not in {"Debit", "Credit"}:
+                raise QuickBooksError(
+                    f"JE line {idx}: posting_type must be 'Debit' or 'Credit'.",
+                    status_code=400,
+                )
+            account_id = item.get("account_id")
+            if not account_id:
+                raise QuickBooksError(f"JE line {idx}: account_id is required.", status_code=400)
+            if posting_type == "Debit":
+                debit_total += amount
+            else:
+                credit_total += amount
+
+            detail: Dict[str, Any] = {
+                "PostingType": posting_type,
+                "AccountRef": {"value": str(account_id)},
+            }
+            if item.get("entity_id"):
+                entity_type = item.get("entity_type") or "Customer"
+                if entity_type not in {"Customer", "Vendor", "Employee"}:
+                    raise QuickBooksError(
+                        f"JE line {idx}: entity_type must be Customer, Vendor, or Employee.",
+                        status_code=400,
+                    )
+                detail["Entity"] = {
+                    "Type": entity_type,
+                    "EntityRef": {"value": str(item["entity_id"])},
+                }
+            if item.get("class_id"):
+                detail["ClassRef"] = {"value": str(item["class_id"])}
+            if item.get("department_id"):
+                detail["DepartmentRef"] = {"value": str(item["department_id"])}
+
+            lines.append({
+                "DetailType": "JournalEntryLineDetail",
+                "Amount": float(amount),
+                "Description": str(item.get("description", "") or ""),
+                "JournalEntryLineDetail": detail,
+            })
+
+        if debit_total != credit_total:
+            raise QuickBooksError(
+                f"Journal entry not balanced: debits={debit_total} credits={credit_total}.",
+                status_code=400,
+            )
+        if debit_total > SETTINGS.max_journal_total_decimal:
+            raise QuickBooksError(
+                f"Journal entry total {debit_total} exceeds configured limit {SETTINGS.max_journal_total_decimal}.",
+                status_code=400,
+            )
+
+        request_hash = compute_request_hash({k: v for k, v in request_payload.items() if k != "idempotency_key"})
+        if idempotency_key:
+            existing = IdempotencyStore.get(idempotency_key)
+            if existing:
+                if existing["tool_name"] != "qb_create_journal_entry" or existing["request_hash"] != request_hash:
+                    raise QuickBooksError(
+                        "idempotency_key has already been used with a different request.",
+                        status_code=409,
+                    )
+                return audit_success("qb_create_journal_entry", realm_id, request_payload, existing["response"])
+
+        payload: Dict[str, Any] = {"Line": lines}
+        if txn_date:
+            payload["TxnDate"] = txn_date
+        if doc_number:
+            payload["DocNumber"] = str(doc_number)
+        if private_note:
+            payload["PrivateNote"] = private_note
+        if currency:
+            payload["CurrencyRef"] = {"value": currency}
+        if exchange_rate is not None:
+            payload["ExchangeRate"] = float(exchange_rate)
+        if adjustment:
+            payload["Adjustment"] = True
+
+        response = qb_client.request(realm_id, "POST", "/journalentry", json_body=payload)
+        result = {"realm_id": realm_id, "journal_entry": response.get("JournalEntry", response)}
+        if idempotency_key:
+            try:
+                IdempotencyStore.put(idempotency_key, "qb_create_journal_entry", request_hash, result)
+            except IntegrityError:
+                pass
+        return audit_success("qb_create_journal_entry", realm_id, request_payload, result)
+    except Exception as exc:
+        audit_failure("qb_create_journal_entry", realm_id, request_payload, exc)
+        raise
+
+
+_VALID_ATTACH_TXN_TYPES = {
+    "Invoice", "Bill", "Purchase", "JournalEntry", "Payment", "Estimate",
+    "CreditMemo", "SalesReceipt", "RefundReceipt", "VendorCredit",
+    "PurchaseOrder", "BillPayment", "Deposit", "Transfer",
+    "Customer", "Vendor", "Item", "Employee",
+}
+
+
+@mcp.tool()
+def qb_create_attachable(
+    filename: str,
+    file_bytes_b64: str,
+    mime: str,
+    link_to_txn_id: Optional[str] = None,
+    link_to_txn_type: Optional[str] = None,
+    note: str = "",
+    company_ref: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Upload a file to QuickBooks and optionally attach it to a transaction or entity.
+
+    filename         — display name for the uploaded file
+    file_bytes_b64   — file content as base64-encoded string
+    mime             — MIME type (e.g. "application/pdf", "image/png")
+    link_to_txn_id   — optional QB entity ID to attach this file to
+    link_to_txn_type — entity type for the link (e.g. "Purchase", "Invoice", "Bill", "JournalEntry")
+    note             — optional note stored on the Attachable
+    Disabled unless QB_ENABLE_ATTACHABLE_WRITE=true.
+    """
+    request_payload = {
+        "filename": filename,
+        "mime": mime,
+        "link_to_txn_id": link_to_txn_id,
+        "link_to_txn_type": link_to_txn_type,
+        "note": note,
+        "company_ref": company_ref,
+        "idempotency_key": idempotency_key,
+        "file_size_b64": len(file_bytes_b64 or ""),
+    }
+    realm_id = None
+    try:
+        if not SETTINGS.enable_attachable_write:
+            raise QuickBooksError("Attachable creation is disabled on this server.", status_code=403)
+        if not filename or not mime or not file_bytes_b64:
+            raise QuickBooksError("filename, mime, and file_bytes_b64 are required.", status_code=400)
+        if (link_to_txn_id and not link_to_txn_type) or (link_to_txn_type and not link_to_txn_id):
+            raise QuickBooksError("link_to_txn_id and link_to_txn_type must be provided together.", status_code=400)
+        if link_to_txn_type and link_to_txn_type not in _VALID_ATTACH_TXN_TYPES:
+            raise QuickBooksError(
+                f"link_to_txn_type must be one of {sorted(_VALID_ATTACH_TXN_TYPES)}.",
+                status_code=400,
+            )
+        realm_id = pick_realm_id(company_ref)
+
+        try:
+            file_bytes = base64.b64decode(file_bytes_b64, validate=True)
+        except Exception as exc:
+            raise QuickBooksError("file_bytes_b64 is not valid base64.", status_code=400) from exc
+        if len(file_bytes) == 0:
+            raise QuickBooksError("file_bytes_b64 decoded to zero bytes.", status_code=400)
+        if len(file_bytes) > SETTINGS.max_attachment_size_bytes:
+            raise QuickBooksError(
+                f"Attachment size {len(file_bytes)} exceeds limit {SETTINGS.max_attachment_size_bytes}.",
+                status_code=400,
+            )
+
+        request_hash = compute_request_hash({
+            "filename": filename,
+            "mime": mime,
+            "link_to_txn_id": link_to_txn_id,
+            "link_to_txn_type": link_to_txn_type,
+            "note": note,
+            "sha256": hashlib.sha256(file_bytes).hexdigest(),
+        })
+        if idempotency_key:
+            existing = IdempotencyStore.get(idempotency_key)
+            if existing:
+                if existing["tool_name"] != "qb_create_attachable" or existing["request_hash"] != request_hash:
+                    raise QuickBooksError(
+                        "idempotency_key has already been used with a different request.",
+                        status_code=409,
+                    )
+                return audit_success("qb_create_attachable", realm_id, request_payload, existing["response"])
+
+        metadata: Dict[str, Any] = {
+            "FileName": filename,
+            "ContentType": mime,
+        }
+        if note:
+            metadata["Note"] = note
+        if link_to_txn_id and link_to_txn_type:
+            metadata["AttachableRef"] = [{
+                "EntityRef": {"value": str(link_to_txn_id), "type": link_to_txn_type},
+                "IncludeOnSend": False,
+            }]
+
+        files = [
+            ("file_metadata_0", ("metadata.json", json.dumps(metadata).encode("utf-8"), "application/json")),
+            ("file_content_0", (filename, file_bytes, mime)),
+        ]
+        response = qb_client.upload_multipart(realm_id, "/upload", files)
+
+        attachables: List[Dict[str, Any]] = []
+        for entry in response.get("AttachableResponse", []) or []:
+            if entry.get("Fault"):
+                raise QuickBooksError(
+                    f"Upload failed: {parse_qb_error_payload(entry['Fault'])}",
+                    status_code=400,
+                )
+            if entry.get("Attachable"):
+                attachables.append(entry["Attachable"])
+        result = {"realm_id": realm_id, "attachables": attachables, "raw": response}
+        if idempotency_key:
+            try:
+                IdempotencyStore.put(idempotency_key, "qb_create_attachable", request_hash, result)
+            except IntegrityError:
+                pass
+        return audit_success("qb_create_attachable", realm_id, request_payload, result)
+    except Exception as exc:
+        audit_failure("qb_create_attachable", realm_id, request_payload, exc)
+        raise
+
+
+def parse_qb_error_payload(fault: Dict[str, Any]) -> str:
+    errors = fault.get("Error", []) or []
+    parts = []
+    for err in errors:
+        code = err.get("code")
+        detail = err.get("Detail") or err.get("Message")
+        parts.append(f"{code}: {detail}" if code else str(detail))
+    return " | ".join(parts) or "Unknown QuickBooks fault."
 
 
 # ─────────────────────────────────────────────────────────
@@ -1745,6 +2382,9 @@ def print_startup_banner() -> None:
     logger.info("Database          : %s", SETTINGS.db_url)
     logger.info("Token encryption  : %s", "enabled" if TOKEN_CIPHER.enabled else "disabled")
     logger.info("Invoice write     : %s", SETTINGS.enable_invoice_write)
+    logger.info("Purchase write    : %s", SETTINGS.enable_purchase_write)
+    logger.info("Journal write     : %s", SETTINGS.enable_journal_write)
+    logger.info("Attachable write  : %s", SETTINGS.enable_attachable_write)
     logger.info("%s", "=" * 78)
 
 

@@ -2,6 +2,10 @@
 
 This package upgrades the local starter into a cloud-ready service you can deploy on your ERP server.
 
+**Version 2.1.0** — adds full purchase/journal-entry/attachable write surface
+(`qb_create_purchase`, `qb_update_purchase`, `qb_void_purchase`,
+`qb_create_journal_entry`, `qb_create_attachable`), bringing the tool count to **67**.
+
 ## What changed from the starter
 - Public-base-URL aware OAuth flow for real HTTPS deployment
 - MCP bearer-token protection for `/mcp`
@@ -131,23 +135,35 @@ Authorization: Bearer <MCP_BEARER_TOKEN>
 ```
 
 ## Available MCP tools
-- `qb_list_companies`
-- `qb_get_company_info`
-- `qb_find_customers`
-- `qb_find_items`
-- `qb_list_invoices`
-- `qb_get_invoice`
-- `qb_get_profit_and_loss`
-- `qb_get_balance_sheet`
-- `qb_get_ar_aging`
-- `qb_create_invoice` (disabled unless `QB_ENABLE_INVOICE_WRITE=true`)
+
+Read tools (always available): `qb_list_companies`, `qb_get_company_info`,
+`qb_find_customers`, `qb_find_items`, `qb_list_invoices`, `qb_get_invoice`,
+`qb_get_profit_and_loss`, `qb_get_balance_sheet`, `qb_get_ar_aging`, plus the
+full expanded read set for vendors, accounts, employees, departments, classes,
+tax codes, payment methods, terms, estimates, credit memos, sales receipts,
+payments, bills, bill payments, purchase orders, purchases, deposits, transfers,
+journal entries, refund receipts, vendor credits, time activities, and reports
+(P&L, P&L detail, balance sheet, cash flow, GL, trial balance, A/R + A/P aging,
+customer/vendor balance + income/expense, transaction list).
+
+Write tools (each off by default — set the matching flag to `true` to enable):
+
+| Tool | Flag | Purpose |
+| --- | --- | --- |
+| `qb_create_invoice` | `QB_ENABLE_INVOICE_WRITE` | Create an invoice |
+| `qb_create_purchase` | `QB_ENABLE_PURCHASE_WRITE` | Create a Cash/Check/CreditCard expense |
+| `qb_update_purchase` | `QB_ENABLE_PURCHASE_WRITE` | Sparse-update an existing purchase |
+| `qb_void_purchase` | `QB_ENABLE_PURCHASE_WRITE` | Delete a purchase (QB has no `void` op on Purchase — uses `operation=delete` for rollback) |
+| `qb_create_journal_entry` | `QB_ENABLE_JOURNAL_WRITE` | Create a balanced journal entry (debits == credits) |
+| `qb_create_attachable` | `QB_ENABLE_ATTACHABLE_WRITE` | Upload a file and optionally link it to a transaction or entity |
 
 ## Write-safety rules in this package
-`qb_create_invoice` is guarded by:
-- global enable/disable flag
-- idempotency key requirement
-- max invoice total threshold
-- audit logging
+Every write tool is guarded by:
+- per-feature enable/disable flag (off by default)
+- idempotency key (required by default for create-style tools; controlled by `QB_REQUIRE_IDEMPOTENCY_KEY`)
+- amount/size threshold (`QB_MAX_INVOICE_TOTAL`, `QB_MAX_PURCHASE_TOTAL`, `QB_MAX_JOURNAL_TOTAL`, `QB_MAX_ATTACHMENT_SIZE_BYTES`)
+- optimistic-lock `SyncToken` for update/void
+- audit logging of every call (success and failure)
 
 ## Database choice
 ### SQLite
