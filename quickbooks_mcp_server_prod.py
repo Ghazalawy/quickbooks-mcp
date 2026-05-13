@@ -1330,6 +1330,30 @@ def qb_create_purchase(
         raise
 
 
+def _verify_purchase_balanced(purchase: Dict[str, Any]) -> Dict[str, Any]:
+    """Verify that sum(Line.Amount) == TotalAmt for a Purchase. Returns a verification block."""
+    lines = purchase.get("Line", []) or []
+    line_sum = Decimal("0")
+    for ln in lines:
+        try:
+            line_sum += Decimal(str(ln.get("Amount", 0)))
+        except InvalidOperation:
+            pass
+    try:
+        total = Decimal(str(purchase.get("TotalAmt", 0)))
+    except InvalidOperation:
+        total = Decimal("0")
+    diff = (line_sum - total).copy_abs()
+    balanced = diff <= Decimal("0.01")  # tolerate sub-cent rounding
+    return {
+        "balanced": bool(balanced),
+        "line_sum": float(line_sum),
+        "total_amt": float(total),
+        "diff": float(diff),
+        "line_count": len(lines),
+    }
+
+
 @mcp.tool()
 def qb_update_purchase(
     purchase_id: str,
@@ -1337,16 +1361,25 @@ def qb_update_purchase(
     patch: Dict[str, Any],
     company_ref: Optional[str] = None,
     sparse: bool = True,
+    verify_after_update: bool = True,
 ) -> Dict[str, Any]:
     """Update an existing Purchase (sparse update by default).
 
     purchase_id  — QuickBooks Purchase.Id
     sync_token   — Purchase.SyncToken from the latest read (required for optimistic locking)
     patch        — fields to update. Supported keys:
-        txn_date, private_note, doc_number, vendor_id, payment_method_id,
-        payment_type, account_id, currency, exchange_rate, line_items
-        (line_items uses the same shape as qb_create_purchase; replaces all lines)
-    sparse       — if true (default), only the listed fields are updated; otherwise full overwrite.
+        txn_date, doc_number, vendor_id, payment_method_id,
+        payment_type, account_id, currency, exchange_rate, line_items,
+        private_note         — REPLACES the existing PrivateNote.
+        private_note_prefix  — READS existing PrivateNote, prepends this string + newline,
+                               then writes the merged value. Safe for audit-trail annotations.
+                               Cannot be combined with private_note.
+        (line_items uses the same shape as qb_create_purchase; REPLACES all lines —
+         QB's API has no per-line patch, so the caller must pass the full Line[] array)
+    sparse              — if true (default), only listed top-level fields are updated.
+    verify_after_update — if true (default), re-reads the Purchase after the write and
+                          verifies sum(Line.Amount) == TotalAmt. Result includes a
+                          `verification` block; raises if the transaction is unbalanced.
     Disabled unless QB_ENABLE_PURCHASE_WRITE=true.
     """
     request_payload = {
@@ -1355,6 +1388,7 @@ def qb_update_purchase(
         "patch": patch,
         "company_ref": company_ref,
         "sparse": sparse,
+        "verify_after_update": verify_after_update,
     }
     realm_id = None
     try:
@@ -1364,6 +1398,11 @@ def qb_update_purchase(
             raise QuickBooksError("purchase_id and sync_token are required.", status_code=400)
         if not isinstance(patch, dict) or not patch:
             raise QuickBooksError("patch must be a non-empty object.", status_code=400)
+        if "private_note" in patch and "private_note_prefix" in patch:
+            raise QuickBooksError(
+                "Pass either private_note (replace) or private_note_prefix (merge), not both.",
+                status_code=400,
+            )
         realm_id = pick_realm_id(company_ref)
 
         payload: Dict[str, Any] = {
@@ -1387,6 +1426,11 @@ def qb_update_purchase(
             payload["TxnDate"] = patch["txn_date"]
         if "private_note" in patch:
             payload["PrivateNote"] = patch["private_note"] or ""
+        if "private_note_prefix" in patch and patch["private_note_prefix"]:
+            existing_purchase = qb_client.request(realm_id, "GET", f"/purchase/{purchase_id}").get("Purchase", {})
+            existing_note = (existing_purchase.get("PrivateNote") or "").strip()
+            prefix = str(patch["private_note_prefix"]).strip()
+            payload["PrivateNote"] = f"{prefix}\n{existing_note}" if existing_note else prefix
         if "doc_number" in patch:
             payload["DocNumber"] = str(patch["doc_number"] or "")
         if "vendor_id" in patch:
@@ -1413,7 +1457,21 @@ def qb_update_purchase(
             payload["Line"] = [_build_purchase_line(idx, item) for idx, item in enumerate(new_lines, start=1)]
 
         response = qb_client.request(realm_id, "POST", "/purchase", json_body=payload)
-        result = {"realm_id": realm_id, "purchase": response.get("Purchase", response)}
+        updated_purchase = response.get("Purchase", response)
+        result: Dict[str, Any] = {"realm_id": realm_id, "purchase": updated_purchase}
+
+        if verify_after_update:
+            verification = _verify_purchase_balanced(updated_purchase)
+            result["verification"] = verification
+            if not verification["balanced"]:
+                raise QuickBooksError(
+                    f"Post-update balance check FAILED: line_sum={verification['line_sum']} "
+                    f"!= total={verification['total_amt']} (diff={verification['diff']}). "
+                    f"Purchase {purchase_id} may be damaged — consider qb_void_purchase to roll back.",
+                    status_code=500,
+                    payload=verification,
+                )
+
         return audit_success("qb_update_purchase", realm_id, request_payload, result)
     except Exception as exc:
         audit_failure("qb_update_purchase", realm_id, request_payload, exc)
